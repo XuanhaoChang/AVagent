@@ -1,0 +1,23 @@
+{
+  "baseline_a": {
+    "initial_fps": 2.0,
+    "max_initial_frames": 0,
+    "dense_sampling": false,
+    "local_crop": false,
+    "audio_mode": "none"
+  },
+  "harness_b": {
+    "initial_fps": 1.0,
+    "max_initial_frames": 48,
+    "dense_sampling": true,
+    "local_crop": true,
+    "audio_mode": "none"
+  },
+  "harness_c": {
+    "initial_fps": 1.0,
+    "max_initial_frames": 48,
+    "dense_sampling": true,
+    "local_crop": true,
+    "audio_mode": "direct"
+  }
+}

@@ -1,0 +1,37 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tools/
+.agents/
+.codex/
+
+# Local datasets, generated evaluations, and model artifacts
+input/
+output/
+artifacts/
+models/
+checkpoints/
+*.onnx
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Large/reference binary documents and office lock files
+docs/*.pdf
+docs/*.pptx
+docs/*.docx
+docs/~$*
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
