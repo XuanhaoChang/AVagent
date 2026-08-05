@@ -13,6 +13,9 @@ from tools.media.ffmpeg import extract_video_frames
 from .schemas import SubtitleObservation, SubtitleSegment, SubtitleTrack
 
 
+UNVERIFIED_SINGLETON_SOURCE = "burned_in_unverified_singleton"
+
+
 class SubtitleExtractionBackend(Protocol):
     name: str
 
@@ -36,6 +39,34 @@ def _same_caption(left: str, right: str) -> bool:
     if left_normalized == right_normalized:
         return True
     return SequenceMatcher(None, left_normalized, right_normalized).ratio() >= 0.9
+
+
+def _textual_characters(text: str) -> str:
+    return "".join(
+        character
+        for character in _normalized_text(text)
+        if character.isalnum()
+    )
+
+
+def is_unverified_singleton(segment: SubtitleSegment) -> bool:
+    """Return whether OCR saw one character in only one sampled frame."""
+
+    return segment.source == UNVERIFIED_SINGLETON_SOURCE
+
+
+def subtitle_evidence_for_judge(
+    track: SubtitleTrack,
+) -> tuple[SubtitleTrack, tuple[SubtitleSegment, ...]]:
+    """Keep raw singleton OCR auditable while withholding it from the judge."""
+
+    rejected = tuple(
+        segment for segment in track.segments if is_unverified_singleton(segment)
+    )
+    accepted = tuple(
+        segment for segment in track.segments if not is_unverified_singleton(segment)
+    )
+    return SubtitleTrack(segments=accepted, backend=track.backend), rejected
 
 
 def _nearby_bbox(
@@ -86,17 +117,23 @@ def merge_subtitle_observations(
             ),
         )
         best_group.append(observation)
-    segments = tuple(
-        SubtitleSegment(
-            start_sec=group[0].timestamp_sec,
-            end_sec=group[-1].timestamp_sec + frame_interval,
-            text=max((item.text for item in group), key=len),
-            bbox=group[len(group) // 2].bbox,
-            confidence=sum(item.confidence for item in group) / len(group),
+    segments = []
+    for group in groups:
+        text = max((item.text for item in group), key=len)
+        source = "burned_in"
+        if len(group) == 1 and len(_textual_characters(text)) <= 1:
+            source = UNVERIFIED_SINGLETON_SOURCE
+        segments.append(
+            SubtitleSegment(
+                start_sec=group[0].timestamp_sec,
+                end_sec=group[-1].timestamp_sec + frame_interval,
+                text=text,
+                bbox=group[len(group) // 2].bbox,
+                confidence=sum(item.confidence for item in group) / len(group),
+                source=source,
+            )
         )
-        for group in groups
-    )
-    return SubtitleTrack(segments=segments, backend=backend)
+    return SubtitleTrack(segments=tuple(segments), backend=backend)
 
 
 def extract_subtitles(

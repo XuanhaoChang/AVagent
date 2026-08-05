@@ -10,7 +10,6 @@ from av_eval.project_env import load_project_env
 from av_eval.text_review import (
     PREDICTION_SOURCES,
     build_messages,
-    enforce_missing_material_category,
     missing_required_materials,
     parse_review_response,
     read_sample,
@@ -90,9 +89,15 @@ class TextReviewTest(unittest.TestCase):
             payload["material_audit"]["missing_required_materials"],
             ["参考视频", "参考音频"],
         )
+        self.assertIsNone(payload["material_audit"]["force_category"])
+        self.assertTrue(
+            payload["material_audit"]["missing_materials_are_not_auto_category_5"]
+        )
         self.assertIn("user_prompt", serialized)
         self.assertNotIn("video.mp4", serialized)
         self.assertNotIn("动作不一致", serialized)
+        self.assertIn("不能\n  自动把任何 prediction_source 归为类别 5", messages[0]["content"])
+        self.assertIn("缺失素材与某个 GT 问题无关", messages[0]["content"])
 
     def test_read_sample_requires_and_returns_input_json(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,7 +181,7 @@ class TextReviewTest(unittest.TestCase):
             (),
         )
 
-    def test_missing_required_materials_forces_every_source_to_category_five(self):
+    def test_missing_required_materials_does_not_force_every_source_to_category_five(self):
         result = {
             "sample_id": "#1",
             "reviews": [
@@ -192,27 +197,21 @@ class TextReviewTest(unittest.TestCase):
                 for source in ("gpt_a", "gpt_d")
             ],
         }
-        overridden = enforce_missing_material_category(
-            result,
-            gt=[{"问题说明": "音色不一致"}, {"问题说明": "动作不一致"}],
-            missing_materials=("参考音频",),
-        )
-
         self.assertEqual(
-            [review["category"] for review in overridden["reviews"]],
-            [5, 5],
+            [review["category"] for review in result["reviews"]],
+            [1, 1],
         )
-        for review in overridden["reviews"]:
-            self.assertEqual(review["category_name"], "输入材料不足")
-            self.assertIn("参考音频", review["reason"])
-            self.assertEqual(review["extra_prediction_indices"], [])
-            self.assertEqual(
-                [row["status"] for row in review["gt_coverage"]],
-                ["insufficient_evidence", "insufficient_evidence"],
-            )
-            self.assertEqual(review["confidence"], "高")
+        self.assertIn("missing_materials_are_not_auto_category_5", build_messages(
+            "#1",
+            {
+                "user_prompt": "使用参考音频1的音色",
+                "generated_video_url": "generated.mp4",
+            },
+            [{"问题说明": "动作不一致"}],
+            {source: [] for source in PREDICTION_SOURCES},
+        )[1]["content"])
 
-    def test_cli_short_circuits_missing_material_sample_without_api(self):
+    def test_cli_reviews_missing_material_sample_with_api_context(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sample_dir = root / "samples" / "sample_001"
@@ -238,13 +237,33 @@ class TextReviewTest(unittest.TestCase):
             output = root / "results.jsonl"
             summary = root / "summary.json"
 
+            response = {
+                "sample_id": "sample_001",
+                "reviews": [
+                    {
+                        "prediction_source": "gpt_d",
+                        "category": 3,
+                        "reason": "缺少参考音频，但GT动作问题仍可判断。",
+                        "gt_coverage": [
+                            {
+                                "gt_index": 1,
+                                "status": "covered",
+                                "matched_prediction_indices": [],
+                                "reason": "动作问题不依赖参考音频。",
+                            }
+                        ],
+                        "extra_prediction_indices": [],
+                        "confidence": "高",
+                    }
+                ],
+            }
             with (
-                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.dict(os.environ, {"ARK_API_KEY": "token"}, clear=True),
                 mock.patch.object(review_script, "load_project_env"),
                 mock.patch.object(
                     review_script,
                     "chat_completion",
-                    side_effect=AssertionError("missing material must not call API"),
+                    return_value=(json.dumps(response, ensure_ascii=False), {}, 123),
                 ),
             ):
                 exit_code = review_script.main(
@@ -263,8 +282,8 @@ class TextReviewTest(unittest.TestCase):
             result = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(result["reviews"][0]["category"], 5)
-        self.assertEqual(result["request_bytes"], 0)
+        self.assertEqual(result["reviews"][0]["category"], 3)
+        self.assertEqual(result["request_bytes"], 123)
         self.assertEqual(result["usage"], {})
 
     def test_parse_review_response_requires_all_sources_and_valid_categories(self):

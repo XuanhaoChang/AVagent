@@ -52,6 +52,12 @@ API_KEY_ENV = "ARK_API_KEY"
 MAX_VISUAL_TOOL_CALLS = 4
 DEFAULT_VIDEO_FRAME_FPS = 2.0
 DEFAULT_VIDEO_FRAME_WIDTH = 384
+TEXT_VISUAL_MARKERS = re.compile(
+    r"文字|字幕|字样|错别字|拼写|文案|标题|招牌|海报|报价单|合同|"
+    r"单据|票据|屏幕|水印|logo|写着|写成|写为|显示|展示",
+    re.IGNORECASE,
+)
+QUOTED_TEXT_SPAN = re.compile(r"[\"“]([^\"”]{1,80})[\"”]")
 PROFILE_DEFAULTS = {
     "baseline_a": {
         "video_frame_fps": 2.0,
@@ -72,6 +78,35 @@ PROFILE_DEFAULTS = {
         "enable_local_crop": True,
     },
 }
+
+
+def needs_text_visual_verification(input_data: Dict[str, Any]) -> bool:
+    """Return whether this row explicitly calls for visible-text inspection."""
+
+    text = "\n".join(
+        str(input_data.get(name) or "")
+        for name in ("user_prompt", "用户反馈")
+    )
+    return bool(TEXT_VISUAL_MARKERS.search(text))
+
+
+def extract_visual_text_candidates(input_data: Dict[str, Any]) -> List[str]:
+    """Extract quoted text near visible-text instructions as review hints."""
+
+    candidates: List[str] = []
+    for field in ("user_prompt", "用户反馈"):
+        text = str(input_data.get(field) or "")
+        for match in QUOTED_TEXT_SPAN.finditer(text):
+            context = text[max(0, match.start() - 24):match.start()]
+            context = re.split(r"[，。；！？—\n\"”]", context)[-1]
+            candidate = match.group(1).strip()
+            if (
+                candidate
+                and TEXT_VISUAL_MARKERS.search(context)
+                and candidate not in candidates
+            ):
+                candidates.append(candidate)
+    return candidates
 
 OUTPUT_KEYS = [
     "可定位性",
@@ -1003,10 +1038,34 @@ def run_agent(
     expert_evidence_dir: Optional[Path],
     enable_local_crop: bool,
     run_stats: Optional[Dict[str, Any]] = None,
+    skill_text_override: Optional[str] = None,
+    runtime_instruction: str = "",
 ) -> str:
     video_path = ensure_video(str(input_data.get("generated_video_url", "")))
+    text_visual_required = needs_text_visual_verification(input_data)
+    text_candidates = extract_visual_text_candidates(input_data)
 
-    skill_text = SKILL_PATH.read_text(encoding="utf-8").strip()
+    skill_text = (
+        skill_text_override.strip()
+        if skill_text_override is not None
+        else SKILL_PATH.read_text(encoding="utf-8").strip()
+    )
+    text_visual_instruction = ""
+    if text_visual_required:
+        candidate_note = (
+            "执行器从自由格式输入中提取到的画面文字候选为："
+            + json.dumps(text_candidates, ensure_ascii=False)
+            + "。这些只是待核查线索，不是问题存在的证明。"
+            if text_candidates
+            else "执行器未可靠提取出固定格式文字候选，仍需按自由格式 prompt 自行识别文字要求。"
+        )
+        text_visual_instruction = (
+            "本行 prompt 或用户反馈明确涉及画面文字。"
+            + candidate_note
+            + "必须逐项核对相关屏幕文字或单据文字，并且在提交结果前至少调用一次 "
+            "extract_frame 或 extract_crop 查看相关时间点的原分辨率证据；"
+            "不得只依据 384px 初始概览帧完成文字判断。"
+        )
     system_message = "\n\n".join(
         [
             skill_text,
@@ -1019,7 +1078,9 @@ def run_agent(
                 + ("小区域候选问题可以调用 extract_crop 做局部放大复核。" if enable_local_crop else "")
                 +
                 "客观画面问题在 finish 前必须查看视觉证据；纯主观评价或建议类反馈不能直接当作可定位问题，但仍需正常检查其他明确问题。"
+                + text_visual_instruction
                 + audio_evidence_instruction(audio_mode)
+                + runtime_instruction.strip()
                 +
                 f"视觉工具总调用次数不得超过 {MAX_VISUAL_TOOL_CALLS}。"
             ),
@@ -1068,6 +1129,12 @@ def run_agent(
             },
         ]
         visual_calls = 0
+        text_visual_verified = False
+        if run_stats is not None:
+            run_stats["text_visual_verification_required"] = text_visual_required
+            run_stats["text_visual_candidates"] = list(text_candidates)
+            run_stats["text_visual_verified"] = False
+            run_stats["tool_calls"] = []
 
         for step in range(1, max(1, max_agent_steps) + 1):
             message = chat_completion(api_url, api_key, model, messages, timeout, api_retries)
@@ -1083,6 +1150,28 @@ def run_agent(
             calls = message.get("tool_calls") or []
             if not calls:
                 if text:
+                    if text_visual_required and not text_visual_verified:
+                        messages.extend(
+                            [
+                                {
+                                    "role": "assistant",
+                                    "content": message.get("content"),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "尚未完成强制的画面文字高清复核。请先调用 "
+                                        "extract_frame 或 extract_crop 查看最相关文字区域，"
+                                        "再提交最终 JSON。"
+                                    ),
+                                },
+                            ]
+                        )
+                        if run_stats is not None:
+                            run_stats["forced_text_visual_retries"] = int(
+                                run_stats.get("forced_text_visual_retries", 0)
+                            ) + 1
+                        continue
                     return filter_prediction_for_audio_mode(
                         parse_prediction(text),
                         audio_mode,
@@ -1097,9 +1186,23 @@ def run_agent(
             for call_index, call in enumerate(calls, start=1):
                 call_id = str(call.get("id") or f"step_{step}_call_{call_index}")
                 name = call.get("function", {}).get("name", "")
+                arguments: Dict[str, Any] = {}
                 try:
                     arguments = tool_arguments(call)
                     if name == "finish":
+                        if text_visual_required and not text_visual_verified:
+                            raise ValueError(
+                                "画面文字任务提交前必须先调用 extract_frame 或 extract_crop"
+                            )
+                        if run_stats is not None:
+                            run_stats["tool_calls"].append(
+                                {
+                                    "step": step,
+                                    "name": name,
+                                    "arguments": arguments,
+                                    "ok": True,
+                                }
+                            )
                         return filter_prediction_for_audio_mode(
                             parse_prediction(
                                 json.dumps(
@@ -1127,6 +1230,10 @@ def run_agent(
                         else:
                             visual = extract_crop(video_path, output_path, meta, arguments)
                         tool_result = {"ok": True, "description": visual["description"]}
+                        if name in {"extract_frame", "extract_crop"}:
+                            text_visual_verified = True
+                            if run_stats is not None:
+                                run_stats["text_visual_verified"] = True
                         image_parts.extend(
                             [
                                 {"type": "text", "text": f"tool_call_id={call_id}: {visual['description']}"},
@@ -1143,6 +1250,18 @@ def run_agent(
                         raise ValueError(f"未知工具：{name}")
                 except Exception as exc:
                     tool_result = {"ok": False, "error": str(exc)}
+                if run_stats is not None:
+                    trace = {
+                        "step": step,
+                        "name": name,
+                        "arguments": arguments,
+                        "ok": bool(tool_result.get("ok")),
+                    }
+                    if "description" in tool_result:
+                        trace["description"] = tool_result["description"]
+                    if "error" in tool_result:
+                        trace["error"] = tool_result["error"]
+                    run_stats["tool_calls"].append(trace)
                 messages.append(
                     {
                         "role": "tool",

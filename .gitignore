@@ -12,6 +12,11 @@ __pycache__/
 .tools/
 .agents/
 .codex/
+.cache/
+.tmp/
+.conda-envs/
+.conda-pkgs/
+.external/
 
 # Local datasets, generated evaluations, and model artifacts
 input/

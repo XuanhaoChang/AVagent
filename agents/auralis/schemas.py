@@ -25,12 +25,14 @@ class AuralisEvidence:
     transcript: SpeechTranscript
     subtitles: SubtitleTrack
     alignment: AlignmentResult
+    constrained_asr: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class AuralisResult:
     status: str
     issues: Tuple[Mapping[str, Any], ...] = ()
+    deterministic_issues: Tuple[Mapping[str, Any], ...] = ()
     evidence: AuralisEvidence | None = None
     error: str = ""
     diagnostics: Mapping[str, Any] = field(default_factory=dict)

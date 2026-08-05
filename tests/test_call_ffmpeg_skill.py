@@ -1,10 +1,98 @@
 import argparse
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import call_ffmpeg_skill as runner
 
 
 class CallFfmpegSkillTest(unittest.TestCase):
+    def test_text_visual_route_extracts_free_format_quoted_candidate(self):
+        input_data = {
+            "user_prompt": "装修报价单上写“据实结算”——这四个字等于“后期随便加钱”",
+            "用户反馈": "展示的文字不对",
+        }
+        self.assertTrue(runner.needs_text_visual_verification(input_data))
+        self.assertEqual(
+            runner.extract_visual_text_candidates(input_data),
+            ["据实结算"],
+        )
+
+    def test_text_visual_route_forces_high_resolution_tool_before_result(self):
+        responses = [
+            {"content": "[]"},
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "frame-1",
+                        "function": {
+                            "name": "extract_frame",
+                            "arguments": '{"timestamp_sec":0.5}',
+                        },
+                    }
+                ],
+            },
+            {"content": "[]"},
+        ]
+        stats = {}
+        with (
+            mock.patch.object(runner, "ensure_video", return_value=Path("video.mp4")),
+            mock.patch.object(runner, "prepare_model_video_frames", return_value=[]),
+            mock.patch.object(
+                runner,
+                "probe_video",
+                return_value={
+                    "duration_sec": 5.0,
+                    "width": 1080,
+                    "height": 1920,
+                    "has_audio": True,
+                },
+            ),
+            mock.patch.object(runner, "build_user_content", return_value=[]),
+            mock.patch.object(
+                runner,
+                "extract_frame",
+                return_value={
+                    "image_path": Path("frame.jpg"),
+                    "description": "高清关键帧，timestamp=0.500s。",
+                },
+            ),
+            mock.patch.object(
+                runner,
+                "image_data_url",
+                return_value="data:image/jpeg;base64,AA==",
+            ),
+            mock.patch.object(runner, "chat_completion", side_effect=responses),
+        ):
+            prediction = runner.run_agent(
+                {
+                    "user_prompt": "单据上显示“据实结算”",
+                    "用户反馈": "文字有误",
+                    "reference_image_urls": [],
+                    "generated_video_url": "video.mp4",
+                },
+                "https://example.test",
+                "token",
+                "gpt",
+                30,
+                1,
+                3,
+                2.0,
+                384,
+                0,
+                "none",
+                None,
+                None,
+                True,
+                stats,
+            )
+
+        self.assertEqual(prediction, "[]")
+        self.assertEqual(stats["forced_text_visual_retries"], 1)
+        self.assertTrue(stats["text_visual_verified"])
+        self.assertEqual(stats["tool_calls"][0]["name"], "extract_frame")
+
     def test_profile_settings_lock_ablation_variables(self):
         args = argparse.Namespace(
             profile="harness_c",

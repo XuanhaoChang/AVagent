@@ -41,12 +41,17 @@ SYSTEM_PROMPT = """\
 3. 至少一个本可由该评测框架回答的 GT 问题被遗漏、只部分覆盖或核心事实不一致。
 4. GT 描述的不是可由“结合明确指令、参考约束和生成音视频证据”回答的问题，
    例如模型降智、抽卡概率、提示词优化、产品功能、审核或纯主观诉求。
-5. GT 问题原则上属于框架范围，但从文本记录可明确判断必要输入材料未提供或不可用，
-   例如缺少所需音频、视频、参考素材或可靠模态证据。
+5. GT 问题原则上属于框架范围，但缺失的输入材料直接导致该 GT 问题无法判断。
+   例如 GT 要求核对参考音色而参考音频缺失，或 GT 要求比较参考视频而参考视频缺失。
 
 判定规则：
-- 材料审计中的 missing_required_materials 非空时，说明 prompt 明确依赖的参考素材
-  没有出现在 input 中；所有 prediction_source 必须直接归为类别 5。
+- 材料审计中的 missing_required_materials 非空只表示发现了 prompt 依赖素材缺口，不能
+  自动把任何 prediction_source 归为类别 5。必须逐个 GT 问题判断该缺口是否使它无法判断。
+- 如果缺失素材与某个 GT 问题无关，仍按可回答问题正常判断预测覆盖：类别 1、2 或 3。
+- 如果 GT 同时包含可判断和因材料缺失而无法判断的问题，不得把所有问题或所有来源一律改成
+  类别 5；对可判断问题继续按覆盖情况分类，并在对应 gt_coverage 中标记材料不足的问题。
+- 只有当材料缺失确实阻断了 GT 所指出问题的判断时，才使用类别 5；材料缺口本身不是类别 5
+  的充分条件。
 - prompt 提到“参考视频”“视频1”等，但 input 没有非空参考视频字段时，属于缺少参考视频；
   generated_video_url 是待评估生成视频，不能当作参考视频。
 - prompt 提到“参考音频”“音频1”“某角色的音色”等外部声音素材，但 input 没有非空
@@ -284,7 +289,8 @@ def build_messages(
         "input": review_input_context(input_data),
         "material_audit": {
             "missing_required_materials": list(missing_materials),
-            "force_category": 5 if missing_materials else None,
+            "force_category": None,
+            "missing_materials_are_not_auto_category_5": True,
         },
         "gt": _object_array(gt, "gt"),
         "predictions": {
@@ -299,73 +305,6 @@ def build_messages(
             "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         },
     ]
-
-
-def enforce_missing_material_category(
-    result: dict[str, Any],
-    *,
-    gt: list[dict[str, Any]],
-    missing_materials: tuple[str, ...],
-) -> dict[str, Any]:
-    if not missing_materials:
-        return result
-    material_text = "、".join(missing_materials)
-    coverage = [
-        {
-            "gt_index": index,
-            "status": "insufficient_evidence",
-            "matched_prediction_indices": [],
-            "reason": f"input 缺少 prompt 明确依赖的{material_text}。",
-        }
-        for index, _ in enumerate(_object_array(gt, "gt"), start=1)
-    ]
-    return {
-        **result,
-        "reviews": [
-            {
-                **review,
-                "category": 5,
-                "category_name": CATEGORY_NAMES[5],
-                "reason": (
-                    f"input 缺少 prompt 明确依赖的{material_text}，"
-                    "无法完整复核该样本，按规则归为输入材料不足。"
-                ),
-                "gt_coverage": coverage,
-                "extra_prediction_indices": [],
-                "confidence": "高",
-            }
-            for review in result.get("reviews", [])
-        ],
-    }
-
-
-def build_missing_material_result(
-    sample_id: str,
-    prediction_sources: tuple[str, ...],
-    gt: list[dict[str, Any]],
-    missing_materials: tuple[str, ...],
-) -> dict[str, Any]:
-    sources = _prediction_sources(prediction_sources)
-    base = {
-        "sample_id": sample_id,
-        "reviews": [
-            {
-                "prediction_source": source,
-                "category": 5,
-                "category_name": CATEGORY_NAMES[5],
-                "reason": "待应用材料缺失规则。",
-                "gt_coverage": [],
-                "extra_prediction_indices": [],
-                "confidence": "高",
-            }
-            for source in sources
-        ],
-    }
-    return enforce_missing_material_category(
-        base,
-        gt=gt,
-        missing_materials=missing_materials,
-    )
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:

@@ -15,6 +15,7 @@ class AlignmentIssue:
     start_sec: float
     end_sec: float
     confidence: str
+    method: str = "component_overlap"
 
 
 @dataclass(frozen=True)

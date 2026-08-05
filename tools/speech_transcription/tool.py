@@ -19,7 +19,7 @@ def transcribe_speech(
     backend: SpeechTranscriptionBackend | None = None,
 ) -> SpeechTranscript:
     if backend is None:
-        from .backends.faster_whisper import FasterWhisperBackend
+        from .backends.sensevoice import SenseVoiceBackend
 
-        backend = FasterWhisperBackend()
+        backend = SenseVoiceBackend()
     return backend.transcribe(audio_path)

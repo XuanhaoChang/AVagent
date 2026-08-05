@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Tuple
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class SpeechSegment:
     text: str
     confidence: str
     words: Tuple[SpeechWord, ...] = ()
+    speaker: str | int | None = None
 
 
 @dataclass(frozen=True)
@@ -30,3 +31,4 @@ class SpeechTranscript:
     backend: str
     model: str
     device: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)

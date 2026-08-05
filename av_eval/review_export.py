@@ -126,6 +126,146 @@ def attach_prediction_to_review_samples(
     return len(prepared)
 
 
+def attach_auralis_evidence_to_review_samples(
+    *,
+    run_log: Path,
+    samples_root: Path,
+    replace: bool = False,
+) -> int:
+    """Attach auditable ASR/OCR evidence from an Agent-D JSONL run log.
+
+    The run log may contain more rows than ``samples_root`` (for example, a
+    selected-sample run writes a source-shaped CSV).  Evidence is matched by
+    the sample's ``序号`` stored in each review package.
+    """
+
+    if not run_log.is_file():
+        raise FileNotFoundError(f"Agent-D run log 不存在：{run_log}")
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(
+        run_log.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError(f"{run_log}:{line_number} 不是 JSON 对象")
+        sample_id = str(record.get("序号", "")).strip()
+        if not sample_id:
+            raise ValueError(f"{run_log}:{line_number} 缺少有效序号")
+        if sample_id in records_by_id:
+            raise ValueError(f"{run_log}:{line_number} 重复样本：{sample_id}")
+        records_by_id[sample_id] = record
+
+    sample_dirs = sorted(
+        path for path in samples_root.glob("sample_*") if path.is_dir()
+    )
+    if not sample_dirs:
+        raise ValueError(f"没有找到 sample_* 目录：{samples_root}")
+
+    prepared: list[tuple[Path, dict[str, Any], Path, dict[str, Any]]] = []
+    for sample_dir in sample_dirs:
+        input_data = json.loads(
+            (sample_dir / "input.json").read_text(encoding="utf-8")
+        )
+        sample_id = str(input_data.get("序号", "")).strip()
+        record = records_by_id.get(sample_id)
+        if record is None:
+            raise ValueError(f"{sample_dir.name} 缺少 run log 证据：{sample_id}")
+        audio = record.get("auralis_audio")
+        if not isinstance(audio, dict):
+            raise ValueError(
+                f"{run_log} 的 {sample_id} 缺少 auralis_audio；"
+                "无法生成 ASR/OCR 人审文件"
+            )
+        status = str(audio.get("status") or "").strip()
+        diagnostics = audio.get("auralis_diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            diagnostics = {"value": diagnostics}
+        evidence = audio.get("auralis_evidence")
+        if not isinstance(evidence, dict):
+            if status != "no_audio":
+                raise ValueError(
+                    f"{run_log} 的 {sample_id} 缺少 auralis_evidence；"
+                    "无法生成 ASR/OCR 人审文件"
+                )
+            reason = str(
+                diagnostics.get("reason")
+                or "ffprobe did not detect an audio stream"
+            )
+            evidence = {
+                "media_metadata": {},
+                "transcript": {
+                    "language": "",
+                    "segments": [],
+                    "backend": "",
+                    "model": "",
+                    "device": "",
+                    "metadata": {"status": status, "reason": reason},
+                },
+                "subtitles": {"segments": [], "backend": ""},
+                "alignment": {"issues": []},
+                "constrained_asr": {
+                    "status": status,
+                    "reason": reason,
+                    "anchors": [],
+                    "candidates": [],
+                    "candidate_scores": [],
+                },
+            }
+
+        common = {
+            "sample_id": sample_id,
+            "row_index": record.get("row_index"),
+            "status": status,
+            "media_metadata": evidence.get("media_metadata", {}),
+            "diagnostics": diagnostics,
+        }
+        asr_payload = {
+            **common,
+            "backend": audio.get("asr_backend") if isinstance(audio, dict) else "",
+            "model": audio.get("asr_model") if isinstance(audio, dict) else "",
+            "device": audio.get("asr_device") if isinstance(audio, dict) else "",
+            "transcript": evidence.get("transcript", {}),
+            "constrained_asr": evidence.get("constrained_asr", {}),
+        }
+        ocr_payload = {
+            **common,
+            "backend": audio.get("subtitle_backend") if isinstance(audio, dict) else "",
+            "subtitles": evidence.get("subtitles", {}),
+            "alignment": evidence.get("alignment", {}),
+        }
+        asr_destination = sample_dir / "asr.json"
+        ocr_destination = sample_dir / "ocr.json"
+        if not replace and (asr_destination.exists() or ocr_destination.exists()):
+            raise FileExistsError(
+                f"ASR/OCR 文件已存在：{sample_dir}；请使用 replace=True"
+            )
+        prepared.append(
+            (asr_destination, asr_payload, ocr_destination, ocr_payload)
+        )
+
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for asr_destination, asr_payload, ocr_destination, ocr_payload in prepared:
+            for destination, payload in (
+                (asr_destination, asr_payload),
+                (ocr_destination, ocr_payload),
+            ):
+                temporary = destination.with_name(f".{destination.name}.new")
+                if temporary.exists():
+                    raise FileExistsError(f"临时证据文件已存在：{temporary}")
+                _write_json(temporary, payload)
+                staged.append((temporary, destination))
+        for temporary, destination in staged:
+            temporary.replace(destination)
+    except Exception:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
+        raise
+    return len(prepared)
+
+
 def export_review_samples(
     *,
     gt_csv: Path,

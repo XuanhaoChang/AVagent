@@ -19,10 +19,8 @@ from av_eval.project_env import load_project_env
 from av_eval.text_review import (
     CATEGORY_NAMES,
     PREDICTION_SOURCES,
-    build_missing_material_result,
     build_messages,
     chat_completion,
-    missing_required_materials,
     parse_review_response,
     read_sample,
 )
@@ -39,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "读取 input、GT 与预测 JSON，用 GPT 对预测覆盖情况做 1-5 类文本复核；"
-            "prompt 依赖但 input 未提供的参考素材强制归为第 5 类。"
+            "仅当缺失素材确实阻断 GT 问题判断时才归为第 5 类。"
         ),
     )
     parser.add_argument(
@@ -205,41 +203,30 @@ def main(argv: list[str] | None = None) -> int:
                 sample_dir,
                 prediction_sources,
             )
-            missing_materials = missing_required_materials(input_data)
             started = time.monotonic()
-            if missing_materials:
-                result = build_missing_material_result(
+            if not api_key:
+                raise ValueError(
+                    "缺少 ARK_API_KEY；请检查项目根目录 .env.local"
+                )
+            text, usage, request_bytes = chat_completion(
+                api_url=args.api_url,
+                api_key=api_key,
+                model=args.model,
+                messages=build_messages(
                     sample_id,
-                    prediction_sources,
+                    input_data,
                     gt,
-                    missing_materials,
-                )
-                usage: dict[str, Any] = {}
-                request_bytes = 0
-            else:
-                if not api_key:
-                    raise ValueError(
-                        "缺少 ARK_API_KEY；请检查项目根目录 .env.local"
-                    )
-                text, usage, request_bytes = chat_completion(
-                    api_url=args.api_url,
-                    api_key=api_key,
-                    model=args.model,
-                    messages=build_messages(
-                        sample_id,
-                        input_data,
-                        gt,
-                        predictions,
-                        prediction_sources,
-                    ),
-                    timeout=args.timeout,
-                    max_attempts=args.api_retries,
-                )
-                result = parse_review_response(
-                    text,
-                    sample_id,
+                    predictions,
                     prediction_sources,
-                )
+                ),
+                timeout=args.timeout,
+                max_attempts=args.api_retries,
+            )
+            result = parse_review_response(
+                text,
+                sample_id,
+                prediction_sources,
+            )
             result.update(
                 {
                     "model": args.model,

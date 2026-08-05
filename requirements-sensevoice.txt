@@ -1,0 +1,12 @@
+# SenseVoice-Small + CAM++ Auralis worker environment. pypinyin prevents
+# orthographic homophones from being promoted to audio/pronunciation errors.
+# Install these in .conda-envs/avbench alongside the existing Python 3.11,
+# PyTorch 2.10.0+cu128 and torchaudio 2.10.0+cu128.
+funasr==1.3.29
+modelscope==1.39.0
+pypinyin==0.55.0
+
+# ModelScope downloads on first use:
+# iic/SenseVoiceSmall, iic/speech_fsmn_vad_zh-cn-16k-common-pytorch,
+# iic/punc_ct-transformer_cn-en-common-vocab471067-large, and
+# iic/speech_campplus_sv_zh-cn_16k-common.

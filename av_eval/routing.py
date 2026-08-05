@@ -31,7 +31,7 @@ def route_observations(
         reasons.append("文本或反馈包含语音/台词可观测信号")
     if has_audio and any(word in text for word in ("口型", "对嘴", "唇", "音画同步")):
         experts.append("av_sync")
-        reasons.append("文本或反馈包含口型或音画同步信号")
+        reasons.append("文本或反馈包含口型或音画同步信号；由 AVBench 负责")
     if any(word in text for word in ("字幕", "文字", "logo", "水印", "屏幕")):
         experts.append("ocr")
         reasons.append("文本或反馈包含画面文字信号")

@@ -1,11 +1,9 @@
-# Auralis local ASR and OCR dependencies.
+# Auralis parent-environment OCR dependencies.
+# SenseVoice-Small + CAM++ run in the isolated Python environment declared in
+# requirements-sensevoice.txt; the parent agent no longer uses large-v3.
 # Python 3.10; verified in the `avagent` Conda environment on 2026-07-28.
-faster-whisper==1.2.1
 rapidocr==3.9.2
 onnxruntime==1.23.2
-
-# Faster-Whisper/CTranslate2 GPU runtime for Linux. The model defaults to
-# large-v3 with cuda/int8_float16. CPU fallback is opt-in via
-# AURALIS_ASR_ALLOW_CPU_FALLBACK=1 so configuration failures are not hidden.
-nvidia-cublas-cu12==12.9.2.10; sys_platform == "linux" and platform_machine == "x86_64"
-nvidia-cudnn-cu12==9.24.0.43; sys_platform == "linux" and platform_machine == "x86_64"
+# The parent test/runtime environment imports AVBench's evaluator modules too.
+# Keep pandas here as well as in third_party/AVBench/requirements.txt.
+pandas==2.3.3
