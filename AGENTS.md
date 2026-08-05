@@ -5,11 +5,11 @@
 - `av_eval/` contains the core dataset, taxonomy, audit, routing, experiment, and CLI modules.
 - `agents/auralis/` implements the local ASR/OCR plus Gemini audio-evaluation agent; shared media, transcription, and subtitle tools are under `tools/`.
 - `scripts/` holds focused experiment, export, smoke-test, and upload entry points. Tests live in `tests/` and use `test_*.py` naming.
-- `docs/evaluation/` contains execution and design notes. `input/`, `output/`, and `models/` are local data/artifact areas; `third_party/AVBench` is an external submodule. Large server-transfer assets are in `server_payload/` and tracked with Git LFS.
+- `README.md` is the public project overview. `input/`, `output/`, and `models/` are local data/artifact areas; `third_party/AVBench` is an external submodule. Private datasets, model weights, and generated media are intentionally kept outside Git.
 
 ## Agent Architecture and Review Workflow
 
-- `call_ffmpeg_skill_gpt_d.py` is the current Agent-D framework, developed incrementally for GPT-A plus Auralis audio/subtitle evidence and Gemini review; it now makes a final GPT text-only synthesis call to organize and deduplicate both results. It is the normal entry point for new evaluation runs.
+- `call_ffmpeg_skill_gpt_d.py` is the current Agent-D framework, developed incrementally for GPT-A plus Auralis audio/subtitle evidence and Gemini review; it now makes a final GPT text-only synthesis call to organize and deduplicate the results. It is the normal entry point for new evaluation runs.
 - `call_ffmpeg_skill.py` is the original baseline implementation kept as a backup and comparison reference; do not treat it as the current architecture.
 - `agents/auralis/` contains the sub-agent orchestration, local ASR/OCR/alignment, and Gemini gateway. `agents/avbench_sync.py` keeps a process-isolated AVBench worker alive; precise audio-video synchronization belongs to AVBench and does not require audio chunks in Agent-D.
 - The installed AVBench runtime is `.conda-envs/avbench`; LatentSync is in `.external/LatentSync`, with the legacy `checkpoints/auxiliary/syncnet_v2.model` checkpoint. The normal ASR/OCR/Gemini runtime remains the `avagent` environment.
@@ -73,4 +73,4 @@ Add or update a corresponding `tests/test_<module>.py` test for behavior changes
 
 ## Commits and Pull Requests
 
-Use short, imperative commit subjects matching the existing history, such as `Add Auralis audio evaluation agent`. Pull requests should explain the behavior change, list validation commands and results, identify any data/model or Git LFS additions, and link the relevant issue or design note. Include screenshots only for documentation or generated-deck changes. Never commit API keys, `.env.local`, raw private evaluation data, or generated artifacts that belong in ignored directories.
+Use short, imperative commit subjects matching the existing history, such as `Add Auralis audio evaluation agent`. Pull requests should explain the behavior change, list validation commands and results, and link the relevant issue or design note. Include screenshots only for documentation or generated-deck changes. Never commit API keys, `.env.local`, raw private evaluation data, model weights, or generated artifacts that belong in ignored directories.
