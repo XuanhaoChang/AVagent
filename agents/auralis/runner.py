@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from difflib import SequenceMatcher
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,11 @@ from agents.auralis.gemini_backend import (
     DEFAULT_MODEL,
     GeminiAuralisJudge,
     GeminiGateway,
+)
+from agents.ocr_visual_verifier import (
+    apply_verdicts as apply_ocr_visual_verdicts,
+    build_ocr_issue_candidates,
+    verify_auralis_ocr_issues,
 )
 from agents.auralis.schemas import AuralisInput
 from agents.seed_lite_specialist import (
@@ -492,6 +498,7 @@ _SUBTITLE_CONTENT_DETAIL_MARKERS = (
 _SPLITTABLE_SUBTITLE_DIMENSIONS = frozenset(
     {"subtitle_presence", "subtitle_content"}
 )
+SYNTHESIS_COVERAGE_KEY = "covered_fact_ids"
 
 
 def _compact_text(value: Any) -> str:
@@ -882,6 +889,145 @@ def preserve_deterministic_issues(
     )
 
 
+def build_synthesis_fact_registry(
+    required_issues: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Assign stable IDs to every atomic fact synthesis must preserve.
+
+    IDs depend on the normalized seven-field issue and semantic dimension, so
+    they are stable across reruns and source ordering. Exact duplicate source
+    rows intentionally share an ID. The supported subtitle composite receives
+    one ID per independently reportable dimension.
+    """
+
+    registry: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for issue in required_issues:
+        normalized = {key: issue.get(key, "") for key in gpt_a.OUTPUT_KEYS}
+        canonical_issue = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for dimension in sorted(_issue_dimensions(normalized)):
+            digest = hashlib.sha256(
+                f"{dimension}\0{canonical_issue}".encode("utf-8")
+            ).hexdigest()[:16]
+            fact_id = f"fact_{digest}"
+            if fact_id in seen_ids:
+                continue
+            seen_ids.add(fact_id)
+            registry.append(
+                {
+                    "fact_id": fact_id,
+                    "semantic_dimension": dimension,
+                    "issue": normalized,
+                }
+            )
+    return registry
+
+
+def _parse_synthesis_response(
+    text: str,
+) -> tuple[List[Dict[str, Any]], List[List[str]]]:
+    """Parse the temporary eight-field synthesis format with fact coverage."""
+
+    stripped = text.strip()
+    start = stripped.find("[")
+    end = stripped.rfind("]")
+    if start < 0 or end < start:
+        raise ValueError("最终 GPT 结果必须包含 JSON 数组")
+    try:
+        value = json.loads(stripped[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError("最终 GPT 结果不是合法 JSON 数组") from exc
+    if not isinstance(value, list):
+        raise ValueError("最终 GPT 结果必须是 JSON 数组")
+
+    issues: List[Dict[str, Any]] = []
+    coverage: List[List[str]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"最终 GPT 第 {index} 个问题必须是对象")
+        raw_fact_ids = item.get(SYNTHESIS_COVERAGE_KEY)
+        if not isinstance(raw_fact_ids, list) or not all(
+            isinstance(fact_id, str) and fact_id.strip()
+            for fact_id in raw_fact_ids
+        ):
+            raise ValueError(
+                f"最终 GPT 第 {index} 个问题缺少有效 {SYNTHESIS_COVERAGE_KEY}"
+            )
+        normalized_text = gpt_a.parse_prediction(
+            json.dumps([item], ensure_ascii=False)
+        )
+        issues.extend(_prediction_array(normalized_text, "最终 GPT"))
+        coverage.append(
+            list(dict.fromkeys(fact_id.strip() for fact_id in raw_fact_ids))
+        )
+    return issues, coverage
+
+
+def preserve_synthesis_fact_coverage(
+    synthesized_issues: Sequence[Mapping[str, Any]],
+    issue_coverage: Sequence[Sequence[str]],
+    fact_registry: Sequence[Mapping[str, Any]],
+    *,
+    run_stats: Dict[str, Any] | None = None,
+) -> str:
+    """Preserve the mandatory union by explicit IDs instead of prose similarity."""
+
+    required_by_id = {
+        str(record.get("fact_id") or ""): record
+        for record in fact_registry
+        if str(record.get("fact_id") or "")
+    }
+    known_ids = set(required_by_id)
+    claimed_ids: set[str] = set()
+    unknown_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    final_issues: List[Dict[str, Any]] = []
+
+    for issue, raw_coverage in zip(synthesized_issues, issue_coverage):
+        coverage = set(raw_coverage)
+        unknown_ids.update(coverage - known_ids)
+        known_coverage = coverage & known_ids
+        new_ids = known_coverage - claimed_ids
+        duplicate_ids.update(known_coverage & claimed_ids)
+        # A second row claiming only IDs already assigned to an earlier row is
+        # a duplicate rendering of the same mandatory fact. Rows without any
+        # mandatory IDs remain valid for AVBench-derived findings.
+        if known_coverage and not new_ids:
+            continue
+        final_issues.append({key: issue.get(key, "") for key in gpt_a.OUTPUT_KEYS})
+        claimed_ids.update(new_ids)
+
+    missing_ids = [fact_id for fact_id in required_by_id if fact_id not in claimed_ids]
+    appended_issue_keys: set[str] = set()
+    for fact_id in missing_ids:
+        raw_issue = required_by_id[fact_id].get("issue")
+        if not isinstance(raw_issue, Mapping):
+            continue
+        issue = {key: raw_issue.get(key, "") for key in gpt_a.OUTPUT_KEYS}
+        issue_key = json.dumps(
+            issue,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if issue_key in appended_issue_keys:
+            continue
+        appended_issue_keys.add(issue_key)
+        final_issues.append(issue)
+
+    if run_stats is not None:
+        run_stats["covered_fact_ids"] = sorted(claimed_ids)
+        run_stats["missing_fact_ids"] = missing_ids
+        run_stats["unknown_fact_ids"] = sorted(unknown_ids)
+        run_stats["duplicate_fact_ids"] = sorted(duplicate_ids)
+    return json.dumps(final_issues, ensure_ascii=False)
+
+
 def merge_predictions(
     gpt_a_prediction: str,
     audio_prediction: str,
@@ -924,6 +1070,8 @@ Seed-Lite 视觉物理专家结果、本地视频元数据约束检查结果和 
    “发膜”且受约束评分支持实际候选时，必须保留，即使 GPT-A 同时报告字幕错字也不能
    合并掉。`expected_preferred` 表示自由识别更可能是假阳性，不得仅凭原始 ASR 差异定性；
    `orthographic_homophone` 表示拼音含声调一致，字符模型偏好不能构成读音错误；
+   `prompt_boundary_artifact` 表示“说道：/问道：”等叙述提示词误入台词边界，不得将其中的
+   “说/道/问/喊”当成应被朗读的台词；
    `ambiguous`、`pronunciation_unverified`、`scoring_failed` 或 `no_reference_dialogue` 也不得
    被升级为确定读音错误。
 7. CAM++ 的 `spk` 是匿名声纹簇标签，不是角色姓名，但仍是角色绑定的检测证据。Auralis
@@ -955,9 +1103,14 @@ Seed-Lite 视觉物理专家结果、本地视频元数据约束检查结果和 
 仍需再次确认而静默丢弃。复合对象被完整拆分后不要原样重复输出；同一时间段的字幕问题
 和台词发音问题仍然是两条独立问题。
 
-最终只输出 JSON 数组，不要 Markdown、解释或其他文字。每个对象必须包含以下 7 个键，
+最终只输出 JSON 数组，不要 Markdown、解释或其他文字。每个对象必须包含以下 8 个键，
 不能省略、不能改名、不能输出 null：可定位性、置信度、问题说明、问题类型、时间区间、
-关键帧秒、BBox。保留 GPT-A 原有的问题类型；Auralis 的问题类型使用“音频质量问题”或
+关键帧秒、BBox、covered_fact_ids。`covered_fact_ids` 是字符串数组，填写该最终对象完整覆盖
+的必保留事实 ID；一条最终问题可以覆盖多个输入事实 ID，但每个事实 ID 在整个输出中只能
+出现一次。语义相同而句式不同（例如分别以“预期应显示”和“实际未显示”描述同一字幕缺失）
+必须合并成一条，并在该条列出全部对应 ID；不得同时输出改写版和输入原文版。
+没有覆盖必保留事实、仅由 AVBench 证据形成的问题填写空数组。程序核对完覆盖关系后会移除
+`covered_fact_ids`，对外结果仍为七字段。保留 GPT-A 原有的问题类型；Auralis 的问题类型使用“音频质量问题”或
 “文字质量问题”。纯音频问题的关键帧秒和 BBox 必须为空字符串。没有问题时输出 []。"""
 
 
@@ -968,6 +1121,7 @@ def build_synthesis_prompt(
     avbench_result: Mapping[str, Any] | None = None,
     seed_lite_prediction: str = "[]",
     metadata_prediction: str = "[]",
+    fact_registry: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     avbench_text = (
         "未提供 AVBench 结果。不得据此推断音画同步问题。"
@@ -988,8 +1142,11 @@ def build_synthesis_prompt(
         f"{metadata_prediction.strip()}\n\n"
         "AVBench 音画同步结果（独立专家证据）：\n"
         f"{avbench_text}\n\n"
+        "必保留原子事实清单（程序生成的稳定 fact_id）：\n"
+        f"{json.dumps(list(fact_registry), ensure_ascii=False)}\n\n"
         "按系统消息逐条审计并完成去重、拆分、保留和格式化：Auralis 与 Seed-Lite 的每个独立问题事实都必须"
-        "保留、明确合并或被原子对象完整覆盖；复合对象拆分后不要重复输出，只输出最终 JSON 数组。"
+        "保留、明确合并或被原子对象完整覆盖；复合对象拆分后不要重复输出。逐项填写 covered_fact_ids，"
+        "确保清单中的每个 fact_id 恰好出现一次，只输出最终 JSON 数组。"
     )
 
 
@@ -1002,7 +1159,7 @@ def final_chat_completion(
     max_attempts: int,
     run_stats: Dict[str, Any] | None = None,
 ) -> str:
-    """Call GPT once for text-only synthesis, without exposing media tools."""
+    """Call GPT once without tools; messages may contain image data."""
     payload = {"model": model, "messages": messages}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_error: BaseException | None = None
@@ -1074,6 +1231,9 @@ def synthesize_predictions(
     run_stats: Dict[str, Any] | None = None,
     deterministic_issues: Sequence[Mapping[str, Any]] = (),
 ) -> str:
+    fact_registry = build_synthesis_fact_registry(deterministic_issues)
+    if run_stats is not None:
+        run_stats["fact_registry"] = fact_registry
     messages = [
         {"role": "system", "content": FINAL_SYNTHESIS_SYSTEM_MESSAGE},
         {
@@ -1085,6 +1245,7 @@ def synthesize_predictions(
                 avbench_result,
                 seed_lite_prediction,
                 metadata_prediction,
+                fact_registry,
             ),
         },
     ]
@@ -1097,10 +1258,13 @@ def synthesize_predictions(
         api_retries,
         run_stats=run_stats,
     )
-    # GPT-A and the final synthesizer share the repository's seven-field output
-    # contract; this also strips optional Markdown fences from the response.
-    parsed = gpt_a.parse_prediction(text)
-    preserved = preserve_deterministic_issues(parsed, deterministic_issues)
+    synthesized_issues, issue_coverage = _parse_synthesis_response(text)
+    preserved = preserve_synthesis_fact_coverage(
+        synthesized_issues,
+        issue_coverage,
+        fact_registry,
+        run_stats=run_stats,
+    )
     return deduplicate_prediction_issues(preserved, "最终问题并集")
 
 
@@ -1159,6 +1323,7 @@ def build_auralis_agent(
                 scorer=asr_backend.score_candidates,
             )
         ),
+        score_speaker_voiceprints=asr_backend.score_speaker_segments,
         extract_subtitles=lambda path: extract_subtitles(
             path,
             backend=ocr_backend,
@@ -1265,8 +1430,16 @@ def run_audio_row(
             run_stats["constrained_asr_status"] = str(
                 result.evidence.constrained_asr.get("status") or "disabled"
             )
-            run_stats["constrained_asr_candidate_count"] = len(
-                result.evidence.constrained_asr.get("candidate_scores", ())
+            candidate_scores = result.evidence.constrained_asr.get(
+                "candidate_scores", ()
+            )
+            run_stats["constrained_asr_candidate_count"] = int(
+                result.evidence.constrained_asr.get(
+                    "candidate_count", len(candidate_scores)
+                )
+            )
+            run_stats["constrained_asr_suppressed_candidate_count"] = len(
+                result.evidence.constrained_asr.get("suppressed_candidates", ())
             )
             # Keep the raw, auditable local evidence alongside the model's
             # issue list.  In particular, ASR/OCR must remain inspectable when
@@ -1280,6 +1453,122 @@ def run_audio_row(
             )
             run_stats["api_calls"] = local_gateway.last_attempts
     return json.dumps(list(result.issues), ensure_ascii=False)
+
+
+def gate_auralis_ocr_prediction(
+    prediction: str,
+    *,
+    input_data: Mapping[str, Any],
+    auralis_stats: Mapping[str, Any],
+    api_url: str,
+    api_key: str,
+    model: str,
+    timeout: int,
+    api_retries: int,
+    run_stats: Dict[str, Any] | None = None,
+) -> str:
+    """Admit non-deterministic OCR issues only after targeted pixel review."""
+
+    issues = _prediction_array(prediction, "Auralis OCR 视觉门控输入")
+    evidence = auralis_stats.get("auralis_evidence", {})
+    if not isinstance(evidence, Mapping):
+        evidence = {}
+    subtitles = evidence.get("subtitles", {})
+    if not isinstance(subtitles, Mapping):
+        subtitles = {}
+    subtitle_segments = [
+        item
+        for item in subtitles.get("segments", ())
+        if isinstance(item, Mapping)
+    ]
+    deterministic_issues = [
+        item
+        for item in auralis_stats.get("deterministic_issues", ())
+        if isinstance(item, Mapping)
+    ]
+    gate_stats: Dict[str, Any] = {}
+    if run_stats is not None:
+        run_stats["ocr_visual_verifier"] = gate_stats
+    preliminary_candidates = build_ocr_issue_candidates(
+        issues,
+        subtitle_segments=subtitle_segments,
+        deterministic_issues=deterministic_issues,
+    )
+    if not preliminary_candidates:
+        gate_stats.update(
+            {
+                "status": "not_needed",
+                "candidate_count": 0,
+                "candidate_reviews": [],
+                "accepted_issues": [dict(issue) for issue in issues],
+            }
+        )
+        return json.dumps(issues, ensure_ascii=False)
+
+    video_path = gpt_a.ensure_video(
+        str(input_data.get("generated_video_url") or "")
+    )
+
+    def complete(messages: List[Dict[str, Any]]) -> str:
+        return final_chat_completion(
+            api_url,
+            api_key,
+            model,
+            messages,
+            timeout,
+            api_retries,
+            run_stats=gate_stats,
+        )
+
+    try:
+        accepted, diagnostics = verify_auralis_ocr_issues(
+            issues,
+            subtitle_segments=subtitle_segments,
+            deterministic_issues=deterministic_issues,
+            user_prompt=str(input_data.get("user_prompt") or ""),
+            video_path=video_path,
+            reference_images=tuple(
+                str(item)
+                for item in input_data.get("reference_image_urls", ())
+            ),
+            complete=complete,
+        )
+        gate_stats.update(diagnostics)
+    except Exception as exc:
+        # A failed verifier must not silently promote the unverified claims it
+        # was introduced to police.  Keep deterministic and non-text Auralis
+        # findings, abstain on the affected model-written OCR candidates, and
+        # expose the complete failure/rejection record for human review.
+        candidates = build_ocr_issue_candidates(
+            issues,
+            subtitle_segments=subtitle_segments,
+            deterministic_issues=deterministic_issues,
+        )
+        verdicts = {
+            candidate.candidate_id: {
+                "decision": "inconclusive",
+                "region_type": "unknown",
+                "reason": "ocr_visual_verifier_failed",
+            }
+            for candidate in candidates
+        }
+        accepted, reviews = apply_ocr_visual_verdicts(
+            issues,
+            candidates=candidates,
+            verdicts=verdicts,
+        )
+        gate_stats.update(
+            {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "candidate_count": len(candidates),
+                "candidate_reviews": reviews,
+                "accepted_issue_count": len(accepted),
+                "rejected_or_abstained_count": len(issues) - len(accepted),
+            }
+        )
+    gate_stats["accepted_issues"] = [dict(issue) for issue in accepted]
+    return json.dumps(accepted, ensure_ascii=False)
 
 
 def run_combined_row(
@@ -1406,6 +1695,22 @@ def run_combined_row(
         raise auralis_error
     if avbench_error is not None:
         raise avbench_error
+    audio_prediction = gate_auralis_ocr_prediction(
+        audio_prediction,
+        input_data=audio_input,
+        auralis_stats=auralis_stats,
+        api_url=api_url,
+        api_key=api_key,
+        model=gpt_a_model,
+        timeout=timeout,
+        api_retries=api_retries,
+        run_stats=run_stats,
+    )
+    ocr_visual_stats = (
+        run_stats.get("ocr_visual_verifier", {})
+        if isinstance(run_stats, Mapping)
+        else {}
+    )
     deduplicated_audio_prediction = deduplicate_prediction_issues(
         audio_prediction,
         "Auralis 音频",
@@ -1465,6 +1770,7 @@ def run_combined_row(
                 gpt_a_stats,
                 seed_lite_stats,
                 auralis_stats,
+                ocr_visual_stats,
                 final_stats,
             )
         )
@@ -1474,6 +1780,7 @@ def run_combined_row(
                 gpt_a_stats,
                 seed_lite_stats,
                 auralis_stats,
+                ocr_visual_stats,
                 final_stats,
             )
         )

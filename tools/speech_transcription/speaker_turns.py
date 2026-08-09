@@ -51,6 +51,8 @@ def _flatten_tokens(value: Any) -> list[str]:
 _SURFACE_TOKEN_RE = re.compile(
     r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+(?:\.\d+)*|[^\s]"
 )
+_SENTENCE_TERMINATORS = {"。", "！", "？", ".", "!", "?"}
+_CLAUSE_SILENCE_GAP_SEC = 0.24
 
 
 def _surface_tokens(value: Any) -> list[str]:
@@ -97,6 +99,40 @@ def _join_tokens(tokens: Sequence[str]) -> str:
             text += " "
         text += token
     return text.strip()
+
+
+def _timestamped_groups(
+    timestamped: Sequence[tuple[str, float, float, int | str | None]],
+) -> list[list[tuple[str, float, float, int | str | None]]]:
+    """Split one FunASR sentence at acoustic turns and explicit sentence ends.
+
+    Punctuation inference can occasionally return several dialogue sentences in
+    one ``sentence_info`` item even though character timestamps are available.
+    Keeping that whole item intact hides single-turn role boundaries (for
+    example, male-female-male dialogue collapsed under one anonymous speaker).
+    Terminal punctuation is source-local evidence for a clause boundary, so it
+    is safe to retain the speaker label while exposing independent text spans.
+    """
+
+    groups: list[list[tuple[str, float, float, int | str | None]]] = []
+    current: list[tuple[str, float, float, int | str | None]] = []
+    for token in timestamped:
+        if current and (
+            current[-1][3] != token[3]
+            or (
+                token[0] not in _SENTENCE_TERMINATORS
+                and token[1] - current[-1][2] > _CLAUSE_SILENCE_GAP_SEC
+            )
+        ):
+            groups.append(current)
+            current = []
+        current.append(token)
+        if token[0] in _SENTENCE_TERMINATORS:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _speaker_for_interval(
@@ -157,14 +193,15 @@ def sentence_info_to_segments(
                         ),
                     )
                 )
-        if timestamped and len({item[3] for item in timestamped}) > 1:
-            groups: list[list[tuple[str, float, float, int | str | None]]] = []
-            for token in timestamped:
-                if not groups or groups[-1][-1][3] != token[3]:
-                    groups.append([token])
-                else:
-                    groups[-1].append(token)
+        groups = _timestamped_groups(timestamped) if timestamped else []
+        # Even one timestamped group is more informative than the sentence
+        # fallback: its speaker was resolved from the captured CAM++ turn.
+        # This matters on the CPU ``vad_segment`` path, where FunASR omits a
+        # sentence-level ``spk`` value but still returns fine-grained turns.
+        if groups:
             for group in groups:
+                if not any(token[0].isalnum() for token in group):
+                    continue
                 text = _join_tokens([token[0] for token in group])
                 if text:
                     segments.append(

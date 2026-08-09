@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 from agents.auralis.schemas import AuralisEvidence, AuralisInput
+from agents.auralis.speaker_plan import extract_prompt_speech_plan
 from tools.media.ffmpeg import (
     extract_audio_wav,
     extract_video_frames,
@@ -32,6 +33,7 @@ from tools.media.ffmpeg import (
 DEFAULT_MODEL = "gemini-3.5-flash"
 VIDEO_FRAME_FPS = 2.0
 VIDEO_FRAME_WIDTH = 384
+MIN_VOICE_CHARACTERISTIC_DURATION_SEC = 0.80
 OUTPUT_KEYS = (
     "可定位性",
     "置信度",
@@ -78,16 +80,27 @@ SYSTEM_MESSAGE = f"""你是 Auralis 音频与字幕取证专家。
 3. 每个问题必须写清预期依据、实际证据、具体差异和发生时间。
 4. 不输出低置信度猜测、纯主观审美、一般建议或正常内容摘要。
 5. 没有明确错误时返回空 JSON 数组。
+6. SenseVoice 原始 rich tag 中 `<|BGM|>` 表示音乐事件而非人声；当
+   `speech_evidence_status=bgm_only` 时，即使清洗前后出现 `The.` 等词形，也不得报告有人声、
+   多余台词或据此生成字幕与语音不一致问题。
 
 字幕和台词的判断规则：
 - 用户 prompt 是自由格式，可能没有台词，也可能用任意格式写台词。不得自行依赖引号、角色冒号、字段名或 Markdown 重新猜测台词。`constrained_asr` 已把完整 ASR 片段与 prompt全文做格式无关的字符级局部对齐；只有其中带 `prompt_start`、`prompt_end` 和`prompt_source_text` 的原文锚点才是可用于受约束评分的 prompt 参考文本。
 - `constrained_asr.status=no_reference_dialogue` 表示没有找到可靠原文锚点，不等于 prompt
   一定没有任何语音要求，但你不得据此编造标准台词。此时只能按 ASR、OCR 和画面已有证据
   检查其他问题。
+- ASR 的正向识别可作为实际台词证据，但单路 ASR 没识别到预期文本不能证明台词缺失；不得
+  仅凭 `no_reference_dialogue`、空转写或错语言短词（如 `おお`）输出“未说出台词”。只有另有
+  独立的语音活动/静音证据明确证明对应时段无人说话时，才可报告台词缺失。
+- 封闭脚本时，`unassigned_segments` 仍只是额外语音候选。持续不超过 1 秒、只有一个英文
+  单词或一两个汉字/假名的未锚定片段，可能是音效、音乐或 ASR 幻觉；没有独立证据时不得
+  升级为多余台词，也不得拿它和 OCR 做字幕错配。
 - 对每个 `candidate_scores` 项严格按本地判定分支处理：`observed_preferred` 表示同一局部
   音频的 CTC 似然明确支持 ASR 实际候选，必须报告 prompt 预期与实际读音/台词差异；
   `expected_preferred` 表示自由 ASR 差异更可能是假阳性，不得报告为确定台词错误；
   `orthographic_homophone` 表示两端拼音（含声调）一致，字符 CTC 偏好不能构成读音错误；
+  `prompt_boundary_artifact` 表示“说道：/问道：”等叙述提示词被对齐成台词边界，不得把
+  提示词中的“说/道/问/喊”报告为实际漏读、错读或多读；
   `ambiguous`、`pronunciation_unverified` 或 `scoring_failed` 只能保留为审计证据，不得升级
   为明确错误。
 - OCR 与有原文锚点的 prompt 参考文本不一致，说明字幕文字可能不符合要求；ASR 与 OCR
@@ -111,6 +124,9 @@ SYSTEM_MESSAGE = f"""你是 Auralis 音频与字幕取证专家。
   表示只允许检查已锚定轮次，其他语音保持 unknown/unassigned，不能擅自绑定；`scope=none`
   时不得仅凭 prompt 做角色绑定。`expected_speaker_count` 是评测目标，不是实际声纹簇 GT，
   不能用它否定 CAM++ 的声学结果或强行把声音拆成该数量。
+- `speaker_evidence_policy.binding_actionable=false` 时，当前证据不允许产生任何说话人绑定、
+  台词归属、共用声纹或角色-spk 结论；不得从 `raw_sentence_info`、声纹数量或完整 WAV 中绕过
+  该门控。原始句级标签只用于人审诊断，只有结构化 `speaker_binding_evidence` 才能作为绑定依据。
 - 优先使用 `speaker_diarization.speaker_turns` 和按这些声纹边界拆分后的 ASR segments。
   `clustering.granularity_conflict=true` 表示旧的标点句级 speaker 数少于细粒度声纹数；此时严禁
   根据整句单一标签声称“全程同一声纹”或据此输出高置信度绑定错误。
@@ -141,6 +157,9 @@ SYSTEM_MESSAGE = f"""你是 Auralis 音频与字幕取证专家。
   作为错误绑定，不能笼统写成“整句应由 spk1 完整发出”。
 - CAM++ 是候选声纹分离工具，不是角色 GT；只有在上述相对冲突不明确时，才降级为不报告，不能
   把“匿名”误解成“不可用于绑定检查”。
+- 反过来，CAM++ 自动聚成一个簇也不等于已经证明多个角色使用同一声音。若多个角色台词只落在
+  一个连续 `speaker_turn` 中，或问题说明中的角色无法对应至少两个文本锚定轮次，不得输出高置信度
+  “共用同一声纹”结论；这种情况属于短片聚类分辨率不足。
 - `speaker_binding_evidence.role_to_speakers` 和 `speaker_to_roles` 是按台词文本锚定得到的相对
   映射；必须逐项核查 `split_role_candidates`、`shared_speaker_candidates` 和
   `unassigned_segments`。这些字段是待核查证据，不是用 prompt 人数强制重聚类的结果；
@@ -149,6 +168,21 @@ SYSTEM_MESSAGE = f"""你是 Auralis 音频与字幕取证专家。
   男性角色明显发女声或女性角色明显发男声。参考材料若包含参考音频或明确音色描述，
   才能进一步核查音色、音调、年龄、音质、口音和其他细节；只有参考图时不得声称
   具体声纹或详细音色已经匹配。
+- `prompt_speech_plan.role_reference_images` 是从 prompt 的“视频角色对照表”中提取的显式
+  `角色 -> 参考图序号` 映射；它只负责确认角色身份和参考图中明显呈现的年龄/性别特征，
+  不代表实际声音已经正确。若请求附带“角色声线核查片段”，该短 WAV 已由 ASR 文本锚点
+  定位到对应角色的实际台词轮次，必须逐项回听并检查明显的男声/女声/童声冲突。
+- 角色发型、服装或剧情身份较中性，不足以推翻清晰参考图中的人物呈现；反过来，参考图
+  本身不明确、短音频混有多人或声线类别不明确时也不得猜测。只报告清楚可辨的跨类别冲突，
+  例如参考图明确呈现女性的林止，其已锚定台词片段却明显为成年男声。
+- 年龄/性别声线冲突是独立于 CAM++ 聚类的音色问题。不得用“同一 speaker 标签”证明它，
+  也不得因为同声纹绑定结论被门控否决而连带删除已有参考图和短音频支持的声线冲突。
+- 性别声线冲突和说话人绑定/共用声纹必须输出为不同问题对象，严禁写在同一个问题说明中。
+  对角色声线核查片段，只陈述参考图人物呈现、该角色已锚定台词和听到的明显声线类别；
+  不要附带“所有角色由同一声纹发出”等 CAM++ 聚类结论。
+- 相同 CAM++ `speaker`/`spk` 标签只表示聚类器认为片段声纹相近，不能证明该声音属于男主，
+  更不能据此推出女主“被绑定为男声”。只有角色声线核查片段中直接听到清楚的男声/女声/童声
+  特征时才能报告性别声线冲突；没有该直接声学证据时，即使男女角色落入同一簇也不得报告。
 
 {OUTPUT_FORMAT}"""
 
@@ -189,10 +223,81 @@ prompt 原文锚点、ASR 时间戳、受约束候选评分、OCR/字幕画面�
 """
 
 
+def _asr_evidence_for_judge(evidence: AuralisEvidence) -> Dict[str, Any]:
+    """Return a judge view that exposes only actionable speaker labels."""
+
+    payload = asdict(evidence.transcript)
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+        payload["metadata"] = metadata
+    binding = metadata.get("speaker_binding_evidence", {})
+    if not isinstance(binding, Mapping):
+        binding = {}
+    plan = metadata.get("prompt_speech_plan", {})
+    if not isinstance(plan, Mapping):
+        plan = {}
+    anchored_turns = [
+        item
+        for item in binding.get("prompt_turn_alignment", ())
+        if isinstance(item, Mapping)
+        and item.get("status") == "anchored"
+        and item.get("role")
+        and item.get("actual_speakers")
+    ]
+    prompt_scope = str(binding.get("prompt_scope") or plan.get("scope") or "")
+    binding_actionable = (
+        binding.get("status") == "fine_grained_turns"
+        and prompt_scope != "none"
+        and bool(anchored_turns)
+    )
+
+    raw_sentences = metadata.get("raw_sentence_info", ())
+    if isinstance(raw_sentences, (list, tuple)):
+        metadata["raw_sentence_info"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key != "spk"
+            }
+            for item in raw_sentences
+            if isinstance(item, Mapping)
+        ]
+
+    if not binding_actionable:
+        for segment in payload.get("segments", ()):
+            if isinstance(segment, dict):
+                segment["speaker"] = None
+        diarization = metadata.get("speaker_diarization", {})
+        if isinstance(diarization, dict):
+            diarization["speaker_turns"] = []
+            for segment in diarization.get("segments", ()):
+                if isinstance(segment, dict):
+                    segment["speaker"] = None
+        clustering = metadata.get("clustering", {})
+        if isinstance(clustering, dict):
+            clustering["embedding_labels"] = []
+            clustering["raw_to_anonymous_label"] = {}
+            clustering["cluster_similarity"] = {}
+
+    metadata["speaker_evidence_policy"] = {
+        "binding_actionable": binding_actionable,
+        "requires_fine_grained_turns": True,
+        "requires_prompt_turn_anchor": True,
+        "raw_sentence_labels_are_diagnostic_only": True,
+        "reason": (
+            "actionable_prompt_anchored_fine_grained_turns"
+            if binding_actionable
+            else "missing_prompt_anchored_fine_grained_turns"
+        ),
+    }
+    return payload
+
+
 def evidence_json(evidence: AuralisEvidence) -> str:
     return json.dumps(
         {
-            "asr": asdict(evidence.transcript),
+            "asr": _asr_evidence_for_judge(evidence),
             "subtitles": asdict(evidence.subtitles),
             "speech_subtitle_alignment": asdict(evidence.alignment),
             "constrained_asr": dict(evidence.constrained_asr),
@@ -219,6 +324,87 @@ def wav_duration_sec(wav_bytes: bytes) -> float:
         raise ValueError(f"无法解析 WAV：{exc}") from exc
 
 
+def slice_wav_bytes(wav_bytes: bytes, start_sec: float, end_sec: float) -> bytes:
+    """Return a valid WAV containing the requested interval."""
+
+    if end_sec <= start_sec:
+        raise ValueError("WAV 切片结束时间必须晚于开始时间")
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as source:
+            frame_rate = source.getframerate()
+            frame_count = source.getnframes()
+            start_frame = min(frame_count, max(0, int(start_sec * frame_rate)))
+            end_frame = min(frame_count, max(start_frame, int(end_sec * frame_rate)))
+            source.setpos(start_frame)
+            frames = source.readframes(end_frame - start_frame)
+            output = io.BytesIO()
+            with wave.open(output, "wb") as target:
+                target.setparams(source.getparams())
+                target.writeframes(frames)
+            return output.getvalue()
+    except (EOFError, wave.Error) as exc:
+        raise ValueError(f"无法切分 WAV：{exc}") from exc
+
+
+def _voice_characteristic_checks(
+    local_evidence_json: str,
+) -> list[dict[str, Any]]:
+    """Build role-labelled acoustic checks from deterministic ASR anchors."""
+
+    try:
+        evidence = json.loads(local_evidence_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    asr = evidence.get("asr", {})
+    metadata = asr.get("metadata", {}) if isinstance(asr, Mapping) else {}
+    if not isinstance(metadata, Mapping):
+        return []
+    plan = metadata.get("prompt_speech_plan", {})
+    binding = metadata.get("speaker_binding_evidence", {})
+    if not isinstance(plan, Mapping) or not isinstance(binding, Mapping):
+        return []
+    role_references = plan.get("role_reference_images", {})
+    if not isinstance(role_references, Mapping):
+        return []
+
+    checks: list[dict[str, Any]] = []
+    for alignment in binding.get("prompt_turn_alignment", ()):
+        if not isinstance(alignment, Mapping) or alignment.get("status") != "anchored":
+            continue
+        role = str(alignment.get("role") or "")
+        reference_indices = role_references.get(role, ())
+        if not isinstance(reference_indices, (list, tuple)) or not reference_indices:
+            continue
+        matched_segments = [
+            segment
+            for segment in alignment.get("matched_segments", ())
+            if isinstance(segment, Mapping)
+            and segment.get("start_sec") is not None
+            and segment.get("end_sec") is not None
+        ]
+        if not matched_segments:
+            continue
+        start_sec = min(float(segment["start_sec"]) for segment in matched_segments)
+        end_sec = max(float(segment["end_sec"]) for segment in matched_segments)
+        if end_sec - start_sec < MIN_VOICE_CHARACTERISTIC_DURATION_SEC:
+            continue
+        checks.append(
+            {
+                "role": role,
+                "reference_image_indices": [int(index) for index in reference_indices],
+                "dialogue_text": str(alignment.get("dialogue_text") or ""),
+                "observed_text": str(alignment.get("observed_text") or ""),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "actual_speakers": list(alignment.get("actual_speakers", ())),
+                "anchor_method": str(alignment.get("anchor_method") or ""),
+            }
+        )
+        if len(checks) >= 8:
+            break
+    return checks
+
+
 def build_user_content(
     *,
     reference_images: Iterable[str],
@@ -230,6 +416,16 @@ def build_user_content(
 ) -> List[Dict[str, Any]]:
     references = list(reference_images)
     frames = list(video_frames)
+    prompt_plan = extract_prompt_speech_plan(user_prompt)
+    role_references = prompt_plan.get("role_reference_images", {})
+    reference_roles: dict[int, list[str]] = {}
+    if isinstance(role_references, Mapping):
+        for role, indices in role_references.items():
+            if not isinstance(indices, (list, tuple)):
+                continue
+            for index in indices:
+                reference_roles.setdefault(int(index), []).append(str(role))
+    voice_checks = _voice_characteristic_checks(local_evidence_json)
     content: List[Dict[str, Any]] = [
         {"text": build_prompt(user_prompt, local_evidence_json)}
     ]
@@ -243,13 +439,53 @@ def build_user_content(
             }
         )
         for index, image_url in enumerate(references, start=1):
+            roles = reference_roles.get(index, [])
+            role_label = f"；对应角色={','.join(roles)}" if roles else ""
             content.extend(
                 [
-                    {"text": f"参考图 {index:02d}/{len(references):02d}"},
+                    {
+                        "text": (
+                            f"参考图 {index:02d}/{len(references):02d}{role_label}"
+                        )
+                    },
                     {
                         "inline_data": {
                             "mime_type": "image/jpeg",
                             "data": image_url.split(",", 1)[-1],
+                        }
+                    },
+                ]
+            )
+    if audio_wav and voice_checks:
+        content.append(
+            {
+                "text": (
+                    "以下为角色声线核查片段。每段都由 ASR 台词文本锚定到明确角色；"
+                    "请将其与标注的角色参考图对照，只检查明显的年龄/性别声线冲突，"
+                    "不要用 CAM++ speaker 编号推断性别。"
+                )
+            }
+        )
+        for index, check in enumerate(voice_checks, start=1):
+            start_sec = float(check["start_sec"])
+            end_sec = float(check["end_sec"])
+            clip = slice_wav_bytes(audio_wav, start_sec, end_sec)
+            content.extend(
+                [
+                    {
+                        "text": (
+                            f"角色声线核查 {index:02d}/{len(voice_checks):02d}："
+                            f"角色={check['role']}；"
+                            f"参考图={check['reference_image_indices']}；"
+                            f"实际时间={start_sec:.2f}s - {end_sec:.2f}s；"
+                            f"预期台词={check['dialogue_text']}；"
+                            f"ASR={check['observed_text']}。"
+                        )
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/wav",
+                            "data": base64.b64encode(clip).decode("ascii"),
                         }
                     },
                 ]

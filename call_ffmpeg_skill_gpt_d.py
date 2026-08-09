@@ -38,13 +38,16 @@ from agents.auralis.runner import (
     preserve_deterministic_issues,
     read_matching_predictions,
     run_audio_row,
+    build_synthesis_fact_registry,
     build_synthesis_prompt,
     build_avbench_runner,
     deduplicate_prediction_issues,
     evaluate_visual_metadata_constraints,
     extract_visual_metadata_constraints,
     final_chat_completion,
+    gate_auralis_ocr_prediction,
     metadata_constraint_issues,
+    preserve_synthesis_fact_coverage,
     run_avbench_row,
     select_evidence_backed_gpt_a_issues,
     synthesize_predictions,
@@ -75,6 +78,7 @@ __all__ = [
     "build_chat_payload",
     "build_avbench_runner",
     "build_prompt",
+    "build_synthesis_fact_registry",
     "build_synthesis_prompt",
     "build_user_content",
     "deduplicate_prediction_issues",
@@ -83,6 +87,7 @@ __all__ = [
     "base64",
     "chat_completion",
     "final_chat_completion",
+    "gate_auralis_ocr_prediction",
     "filter_seed_lite_candidates",
     "gpt_a",
     "inference_input",
@@ -92,6 +97,7 @@ __all__ = [
     "parse_args",
     "parse_prediction",
     "preserve_deterministic_issues",
+    "preserve_synthesis_fact_coverage",
     "read_matching_predictions",
     "run_audio_row",
     "run_avbench_row",
@@ -201,6 +207,22 @@ def run_combined_row(
         raise auralis_error
     if avbench_error is not None:
         raise avbench_error
+    audio_prediction = gate_auralis_ocr_prediction(
+        audio_prediction,
+        input_data=audio_input,
+        auralis_stats=auralis_stats,
+        api_url=api_url,
+        api_key=api_key,
+        model=gpt_a_model,
+        timeout=timeout,
+        api_retries=api_retries,
+        run_stats=run_stats,
+    )
+    ocr_visual_stats = (
+        run_stats.get("ocr_visual_verifier", {})
+        if isinstance(run_stats, dict)
+        else {}
+    )
     deduplicated_audio_prediction = deduplicate_prediction_issues(
         audio_prediction,
         "Auralis 音频",
@@ -241,11 +263,21 @@ def run_combined_row(
         run_stats["final_prediction"] = json.loads(final_prediction)
         run_stats["api_calls"] = sum(
             int(stats.get("api_calls", 0))
-            for stats in (gpt_a_stats, auralis_stats, final_stats)
+            for stats in (
+                gpt_a_stats,
+                auralis_stats,
+                ocr_visual_stats,
+                final_stats,
+            )
         )
         run_stats["request_bytes"] = sum(
             int(stats.get("request_bytes", 0))
-            for stats in (gpt_a_stats, auralis_stats, final_stats)
+            for stats in (
+                gpt_a_stats,
+                auralis_stats,
+                ocr_visual_stats,
+                final_stats,
+            )
         )
     return final_prediction
 

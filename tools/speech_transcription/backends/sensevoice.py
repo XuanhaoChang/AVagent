@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from threading import Lock
 from typing import Any, Mapping, Sequence
@@ -18,6 +19,21 @@ from ..schemas import SpeechSegment, SpeechTranscript
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _EVENT_MARKERS = ("🎼", "😊", "😔", "😡", "😐")
+_SENSEVOICE_EVENT = re.compile(r"<\|(?P<event>Speech|BGM)\|>", re.IGNORECASE)
+_CJK_CHARACTER = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_LATIN_WORD = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
+_BGM_PLACEHOLDER_WORDS = {
+    "a",
+    "ah",
+    "an",
+    "eh",
+    "hmm",
+    "oh",
+    "the",
+    "uh",
+    "um",
+    "yeah",
+}
 
 
 def _flatten_text(value: Any) -> str:
@@ -54,11 +70,63 @@ def _clean_text(value: Any) -> str:
     return " ".join(text.split()).strip(" ，。！？、")
 
 
+def _has_substantial_lexical_speech(
+    raw_text: Any,
+    raw_segments: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Distinguish real lexical output from common BGM hallucination tokens."""
+
+    segment_text = " ".join(
+        text
+        for text in (
+            _clean_text(item.get("text"))
+            for item in raw_segments
+            if isinstance(item, Mapping)
+        )
+        if text
+    )
+    text = segment_text or _clean_text(raw_text)
+    cjk_characters = _CJK_CHARACTER.findall(text)
+    if len(cjk_characters) >= 4:
+        return True
+    latin_words = [word.casefold() for word in _LATIN_WORD.findall(text)]
+    informative_words = [
+        word for word in latin_words if word not in _BGM_PLACEHOLDER_WORDS
+    ]
+    return len(informative_words) >= 3 and sum(map(len, informative_words)) >= 8
+
+
+def _sensevoice_event_evidence(
+    raw_text: Any,
+    raw_segments: Sequence[Mapping[str, Any]] = (),
+) -> tuple[list[str], str]:
+    """Classify SenseVoice rich tags before their text is normalized away.
+
+    ``<|BGM|>`` means that music is present, not necessarily that speech is
+    absent.  Keep substantial timestamped lexical output as speech-with-BGM,
+    while suppressing short placeholders such as repeated ``The.``.
+    """
+
+    events = list(
+        dict.fromkeys(
+            match.group("event").casefold()
+            for match in _SENSEVOICE_EVENT.finditer(str(raw_text or ""))
+        )
+    )
+    if "speech" in events:
+        return events, "speech_with_bgm" if "bgm" in events else "speech_present"
+    if "bgm" in events and _has_substantial_lexical_speech(raw_text, raw_segments):
+        return events, "speech_with_bgm"
+    if "bgm" in events:
+        return events, "bgm_only"
+    return events, "unclassified"
+
+
 def _prompt_turn_speaker_alignment(
     prompt_speech_plan: Mapping[str, Any],
     segments: Sequence[SpeechSegment],
 ) -> list[dict[str, Any]]:
-    """Map explicitly timed prompt turns to observed anonymous speakers."""
+    """Map prompt dialogue turns to observed anonymous speakers."""
 
     prompt_turns = [
         turn
@@ -73,7 +141,7 @@ def _prompt_turn_speaker_alignment(
         )
         for turn in prompt_turns
     ]
-    text_assignments: dict[int, list[tuple[SpeechSegment, float]]] = {
+    text_assignments: dict[int, list[tuple[SpeechSegment, float, float]]] = {
         index: [] for index in range(len(prompt_turns))
     }
     for segment in segments:
@@ -85,9 +153,11 @@ def _prompt_turn_speaker_alignment(
         if len(observed) < 2 or segment.speaker is None:
             continue
         scores = []
+        observed_precisions = []
         for expected in normalized_dialogues:
             if not expected:
                 scores.append(0.0)
+                observed_precisions.append(0.0)
                 continue
             matcher = SequenceMatcher(None, expected, observed)
             matched = sum(block.size for block in matcher.get_matching_blocks())
@@ -97,6 +167,7 @@ def _prompt_turn_speaker_alignment(
                     matched / max(1, min(len(expected), len(observed))),
                 )
             )
+            observed_precisions.append(matched / max(1, len(observed)))
         if not scores:
             continue
         winner = max(range(len(scores)), key=scores.__getitem__)
@@ -105,19 +176,24 @@ def _prompt_turn_speaker_alignment(
             default=0.0,
         )
         if scores[winner] >= 0.55 and scores[winner] - runner_up >= 0.10:
-            text_assignments[winner].append((segment, scores[winner]))
+            text_assignments[winner].append(
+                (segment, scores[winner], observed_precisions[winner])
+            )
 
     aligned: list[dict[str, Any]] = []
     for turn_index, turn in enumerate(prompt_turns):
         start = turn.get("expected_start_sec")
         end = turn.get("expected_end_sec")
-        if start is None or end is None or float(end) <= float(start):
-            continue
+        has_time_window = (
+            start is not None
+            and end is not None
+            and float(end) > float(start)
+        )
         speaker_durations: dict[str | int, float] = {}
         matched_text: list[str] = []
         text_matches = text_assignments.get(turn_index, [])
         if text_matches:
-            for segment, _score in text_matches:
+            for segment, _score, _observed_precision in text_matches:
                 matched_text.append(segment.text)
                 speaker_durations[segment.speaker] = (
                     speaker_durations.get(segment.speaker, 0.0)
@@ -125,7 +201,7 @@ def _prompt_turn_speaker_alignment(
                     - segment.start_sec
                 )
             anchor_method = "dialogue_text_similarity"
-        else:
+        elif has_time_window:
             for segment in segments:
                 overlap = min(float(end), segment.end_sec) - max(
                     float(start), segment.start_sec
@@ -138,6 +214,8 @@ def _prompt_turn_speaker_alignment(
                         speaker_durations.get(segment.speaker, 0.0) + overlap
                     )
             anchor_method = "time_window_only"
+        else:
+            continue
         supported_speakers = [
             speaker
             for speaker, duration in sorted(
@@ -146,41 +224,50 @@ def _prompt_turn_speaker_alignment(
             )
             if duration >= 0.20
         ]
-        aligned.append(
-            {
-                "role": str(turn.get("role") or ""),
-                "dialogue_text": str(turn.get("dialogue_text") or ""),
-                "expected_start_sec": float(start),
-                "expected_end_sec": float(end),
-                "actual_speakers": supported_speakers,
-                "speaker_overlap_sec": {
-                    str(speaker): round(duration, 3)
-                    for speaker, duration in speaker_durations.items()
-                },
-                "observed_text": "".join(matched_text),
-                "status": (
-                    "anchored"
-                    if supported_speakers and text_matches
-                    else "time_window_only"
-                    if supported_speakers
-                    else "unmatched"
-                ),
-                "anchor_method": anchor_method,
-                "dialogue_match_scores": [
-                    round(score, 3) for _segment, score in text_matches
-                ],
-                "matched_segments": [
-                    {
-                        "start_sec": segment.start_sec,
-                        "end_sec": segment.end_sec,
-                        "speaker": segment.speaker,
-                        "text": segment.text,
-                        "dialogue_match_score": round(score, 3),
-                    }
-                    for segment, score in text_matches
-                ],
-            }
-        )
+        alignment = {
+            "role": str(turn.get("role") or ""),
+            "dialogue_text": str(turn.get("dialogue_text") or ""),
+            "actual_speakers": supported_speakers,
+            "speaker_overlap_sec": {
+                str(speaker): round(duration, 3)
+                for speaker, duration in speaker_durations.items()
+            },
+            "observed_text": "".join(matched_text),
+            "status": (
+                "anchored"
+                if supported_speakers and text_matches
+                else "time_window_only"
+                if supported_speakers
+                else "unmatched"
+            ),
+            "anchor_method": anchor_method,
+            "dialogue_match_scores": [
+                round(score, 3)
+                for _segment, score, _observed_precision in text_matches
+            ],
+            "dialogue_observed_precisions": [
+                round(observed_precision, 3)
+                for _segment, _score, observed_precision in text_matches
+            ],
+            "matched_segments": [
+                {
+                    "start_sec": segment.start_sec,
+                    "end_sec": segment.end_sec,
+                    "speaker": segment.speaker,
+                    "text": segment.text,
+                    "dialogue_match_score": round(score, 3),
+                    "dialogue_observed_precision": round(
+                        observed_precision,
+                        3,
+                    ),
+                }
+                for segment, score, observed_precision in text_matches
+            ],
+        }
+        if has_time_window:
+            alignment["expected_start_sec"] = float(start)
+            alignment["expected_end_sec"] = float(end)
+        aligned.append(alignment)
     return aligned
 
 
@@ -298,6 +385,15 @@ class SenseVoiceBackend:
         )
         self.campp_similarity_threshold = float(
             os.getenv("AURALIS_CAMPP_SIM_THRESHOLD", "0.78")
+        )
+        # Direct verification is deliberately stricter than the model card's
+        # general speaker-verification operating point.  It is used to assert
+        # a generated-video defect, so ambiguous pairs must abstain.
+        self.campp_voiceprint_same_threshold = float(
+            os.getenv("AURALIS_CAMPP_VERIFY_SAME_THRESHOLD", "0.55")
+        )
+        self.campp_voiceprint_different_threshold = float(
+            os.getenv("AURALIS_CAMPP_VERIFY_DIFFERENT_THRESHOLD", "0.30")
         )
         self.fallback_reason = ""
         self._worker: subprocess.Popen[str] | None = None
@@ -423,7 +519,23 @@ class SenseVoiceBackend:
         if not audio_path.is_file():
             raise FileNotFoundError(f"待转写音频不存在：{audio_path}")
         response = self._request(audio_path)
-        segments = self._segments(response)
+        event_types, speech_evidence_status = _sensevoice_event_evidence(
+            response.get("raw_text"),
+            tuple(
+                item
+                for item in response.get("segments", ())
+                if isinstance(item, Mapping)
+            ),
+        )
+        # SenseVoice sometimes emits lexical-looking placeholders such as
+        # "The." for instrumental music while explicitly tagging every event
+        # as BGM. Such placeholders are not speech and must not enter CAM++
+        # binding or ASR/OCR alignment.
+        segments = (
+            ()
+            if speech_evidence_status == "bgm_only"
+            else self._segments(response)
+        )
         prompt_speech_plan = extract_prompt_speech_plan(user_prompt)
         speaker_segments = [
             {
@@ -445,6 +557,8 @@ class SenseVoiceBackend:
             and item.get("start_sec") is not None
             and item.get("end_sec") is not None
         ]
+        if speech_evidence_status == "bgm_only":
+            speaker_turns = []
         turn_speakers = {
             item["speaker"]
             for item in speaker_turns
@@ -455,7 +569,23 @@ class SenseVoiceBackend:
             for item in speaker_segments
             if item["speaker"] is not None
         }
-        clustering = response.get("speaker_clustering") or {}
+        clustering = dict(response.get("speaker_clustering") or {})
+        if speech_evidence_status == "bgm_only":
+            clustering["suppressed_bgm_embedding_count"] = int(
+                clustering.get("embedding_count", 0)
+            )
+            clustering.update(
+                {
+                    "embedding_count": 0,
+                    "embedding_labels": [],
+                    "embedding_cluster_count": 0,
+                    "speaker_turn_count": 0,
+                    "turn_speaker_count": 0,
+                    "sentence_speaker_count": 0,
+                    "granularity_conflict": False,
+                    "raw_to_anonymous_label": {},
+                }
+            )
         binding_status = (
             "fine_grained_turns"
             if speaker_turns
@@ -510,6 +640,8 @@ class SenseVoiceBackend:
                     **binding_summary,
                 },
                 "raw_text": str(response.get("raw_text") or ""),
+                "audio_event_types": event_types,
+                "speech_evidence_status": speech_evidence_status,
                 "raw_sentence_info": response.get("raw_sentence_info") or [],
                 "clustering": clustering,
             },
@@ -545,6 +677,42 @@ class SenseVoiceBackend:
                 "use_campp": self.use_campp,
                 "campp_similarity_threshold": self.campp_similarity_threshold,
                 "candidates": score_requests,
+            }
+        )
+
+    def score_speaker_segments(
+        self,
+        audio_path: Path,
+        clips: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Directly compare prompt-anchored clips with the local CAM++ model."""
+
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"待评分音频不存在：{audio_path}")
+        requests = [
+            {
+                "clip_id": str(item.get("clip_id") or ""),
+                "start_sec": float(item["start_sec"]),
+                "end_sec": float(item["end_sec"]),
+            }
+            for item in clips
+        ]
+        return self._worker_request(
+            {
+                "action": "score_speaker_segments",
+                "audio_path": str(audio_path),
+                "model_name": self.model_name,
+                "device": self.device,
+                "language": self.language,
+                "use_campp": self.use_campp,
+                "campp_similarity_threshold": self.campp_similarity_threshold,
+                "same_speaker_threshold": (
+                    self.campp_voiceprint_same_threshold
+                ),
+                "different_speaker_threshold": (
+                    self.campp_voiceprint_different_threshold
+                ),
+                "clips": requests,
             }
         )
 

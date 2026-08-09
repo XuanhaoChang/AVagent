@@ -144,6 +144,27 @@ class PromptReferenceExtractionTest(unittest.TestCase):
         self.assertEqual(result["status"], "no_reference_dialogue")
         self.assertEqual(result["candidates"], [])
 
+    def test_suppresses_narration_speech_cue_at_dialogue_boundary(self):
+        prompt = "戏谑说道：他没事，很舒服。"
+        transcript = _transcript(
+            SpeechSegment(9.82, 9.88, "了", "medium", speaker=2),
+            SpeechSegment(10.0, 10.66, "他没事", "medium", speaker=2),
+            SpeechSegment(10.84, 11.68, "很舒服", "medium", speaker=2),
+        )
+
+        result = extract_prompt_reference_candidates(prompt, transcript)
+
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(len(result["suppressed_candidates"]), 1)
+        self.assertEqual(
+            result["suppressed_candidates"][0]["decision"],
+            "prompt_boundary_artifact",
+        )
+        self.assertEqual(
+            result["suppressed_candidates"][0]["prompt_source_text"],
+            "道：他没事，很舒服",
+        )
+
 
 class ConstrainedScoringDecisionTest(unittest.TestCase):
     def setUp(self):
@@ -342,6 +363,37 @@ class ConstrainedScoringIntegrationTest(unittest.TestCase):
         self.assertEqual(
             set(captured["candidates"][0]),
             {"candidate_id", "start_sec", "end_sec", "observed_text", "expected_text"},
+        )
+
+    def test_sensevoice_voiceprint_request_excludes_role_and_prompt_text(self):
+        backend = SenseVoiceBackend(device="cpu", use_campp=True)
+        captured = {}
+
+        def fake_request(request):
+            captured.update(request)
+            return {"ok": True, "clips": [], "pairs": []}
+
+        with TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"RIFF")
+            with mock.patch.object(backend, "_worker_request", side_effect=fake_request):
+                backend.score_speaker_segments(
+                    audio_path,
+                    [
+                        {
+                            "clip_id": "prompt-turn-000-part-00",
+                            "start_sec": 1.0,
+                            "end_sec": 2.0,
+                            "role": "不得发送给声学模型",
+                            "dialogue_text": "秘密台词",
+                        }
+                    ],
+                )
+
+        self.assertEqual(captured["action"], "score_speaker_segments")
+        self.assertEqual(
+            set(captured["clips"][0]),
+            {"clip_id", "start_sec", "end_sec"},
         )
 
     def test_auralis_scores_before_gemini_and_appends_local_issue(self):

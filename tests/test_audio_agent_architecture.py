@@ -994,6 +994,23 @@ class AudioAgentArchitectureTest(unittest.TestCase):
             transcript=transcript,
             subtitles=subtitles,
             alignment=check_speech_subtitle_alignment(transcript, subtitles),
+            constrained_asr={
+                "status": "scored",
+                "candidate_count": 1,
+                "candidate_scores": [
+                    {"candidate_id": "kept"},
+                    {
+                        "candidate_id": "suppressed",
+                        "decision": "prompt_boundary_artifact",
+                    },
+                ],
+                "suppressed_candidates": [
+                    {
+                        "candidate_id": "suppressed",
+                        "decision": "prompt_boundary_artifact",
+                    }
+                ],
+            },
         )
 
         class FakeAuralis:
@@ -1037,6 +1054,8 @@ class AudioAgentArchitectureTest(unittest.TestCase):
             9.0,
         )
         self.assertIn("alignment", stats["auralis_evidence"])
+        self.assertEqual(stats["constrained_asr_candidate_count"], 1)
+        self.assertEqual(stats["constrained_asr_suppressed_candidate_count"], 1)
         json.dumps(stats, ensure_ascii=False)
 
     def test_cuda_backend_is_fail_fast_by_default(self):

@@ -20,6 +20,7 @@ from tools.speech_transcription.speaker_turns import (
 _PROTOCOL_STDOUT = sys.stdout
 sys.stdout = sys.stderr
 _MODEL_CACHE: dict[tuple[str, str, bool, float], Any] = {}
+_SPEAKER_MODEL_CACHE: dict[str, Any] = {}
 
 
 class _SmallSampleCamppCluster:
@@ -36,6 +37,45 @@ class _SmallSampleCamppCluster:
     def __init__(self, merge_threshold: float = 0.78) -> None:
         self.merge_threshold = merge_threshold
         self.last_labels: list[int] = []
+        self.last_cluster_status = "not_run"
+        self.last_cluster_quality: dict[str, dict[str, float | int]] = {}
+
+    def reset_diagnostics(self) -> None:
+        self.last_labels = []
+        self.last_cluster_status = "not_run"
+        self.last_cluster_quality = {}
+
+    def _record_cluster_quality(self, values: Any, labels: list[int]) -> None:
+        import numpy as np
+
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        normalized = values / np.maximum(norms, 1e-12)
+        similarities = np.matmul(normalized, normalized.T)
+        quality: dict[str, dict[str, float | int]] = {}
+        for label in sorted(set(labels)):
+            indices = [index for index, item in enumerate(labels) if item == label]
+            pairs = [
+                float(similarities[left, right])
+                for offset, left in enumerate(indices)
+                for right in indices[offset + 1 :]
+            ]
+            item: dict[str, float | int] = {
+                "window_count": len(indices),
+                "within_pair_count": len(pairs),
+            }
+            if pairs:
+                item.update(
+                    {
+                        "within_similarity_min": round(min(pairs), 6),
+                        "within_similarity_mean": round(
+                            sum(pairs) / len(pairs),
+                            6,
+                        ),
+                        "within_similarity_max": round(max(pairs), 6),
+                    }
+                )
+            quality[str(label)] = item
+        self.last_cluster_quality = quality
 
     def __call__(self, embeddings: Any, oracle_num: int | None = None):
         import numpy as np
@@ -50,9 +90,13 @@ class _SmallSampleCamppCluster:
         count = values.shape[0]
         if count == 0:
             self.last_labels = []
+            self.last_cluster_status = "no_embeddings"
+            self.last_cluster_quality = {}
             return np.zeros(0, dtype="int")
         if count == 1:
             self.last_labels = [0]
+            self.last_cluster_status = "single_embedding"
+            self._record_cluster_quality(values, self.last_labels)
             return np.zeros(1, dtype="int")
 
         # Use FunASR's normal spectral clustering algorithm without its
@@ -75,16 +119,22 @@ class _SmallSampleCamppCluster:
                 labels = ClusterBackend(merge_thr=self.merge_threshold).merge_by_cos(
                     labels, values, self.merge_threshold
                 )
-        except Exception:
+            self.last_cluster_status = "spectral_clustered"
+        except Exception as exc:
             # A conservative fallback keeps the evidence usable if a future
-            # sklearn/scipy version rejects a tiny affinity matrix.
+            # sklearn/scipy version rejects a tiny affinity matrix.  The
+            # fallback is explicitly non-actionable for shared-voice claims.
             labels = np.zeros(count, dtype="int")
+            self.last_cluster_status = (
+                f"fallback_single_cluster:{type(exc).__name__}"
+            )
         label_by_root: dict[int, int] = {}
         labels = [
             label_by_root.setdefault(int(label), len(label_by_root))
             for label in labels
         ]
         self.last_labels = [int(label) for label in labels]
+        self._record_cluster_quality(values, self.last_labels)
         return np.asarray(labels, dtype="int")
 
 
@@ -126,12 +176,20 @@ def _load_model(
 
     key = (model_name, device, use_campp, campp_similarity_threshold)
     if key not in _MODEL_CACHE:
+        # The punctuation model is sizeable and is not required for CAM++'s
+        # VAD-segment mode.  On CPU fallback, omitting it keeps the persistent
+        # worker below the process memory ceiling; timestamped ASR text and
+        # fine-grained speaker turns remain available for local alignment.
+        use_punctuation_model = use_campp and device == "cuda"
         model = AutoModel(
             model=model_name,
             vad_model="fsmn-vad",
             vad_kwargs={"max_single_segment_time": 30000},
-            punc_model="ct-punc" if use_campp else None,
+            punc_model="ct-punc" if use_punctuation_model else None,
             spk_model="cam++" if use_campp else None,
+            spk_mode=(
+                "punc_segment" if use_punctuation_model else "vad_segment"
+            ),
             device="cuda:0" if device == "cuda" else "cpu",
             disable_update=True,
         )
@@ -139,6 +197,20 @@ def _load_model(
             model.cb_model = _SmallSampleCamppCluster(campp_similarity_threshold)
         _MODEL_CACHE[key] = model
     return _MODEL_CACHE[key]
+
+
+def _load_speaker_verification_model(device: str):
+    """Load only CAM++ for direct verification, including on CPU fallback."""
+
+    from funasr import AutoModel
+
+    if device not in _SPEAKER_MODEL_CACHE:
+        _SPEAKER_MODEL_CACHE[device] = AutoModel(
+            model="iic/speech_campplus_sv_zh-cn_16k-common",
+            device="cuda:0" if device == "cuda" else "cpu",
+            disable_update=True,
+        )
+    return _SPEAKER_MODEL_CACHE[device]
 
 
 def _generate_with_speaker_turn_capture(model: Any, **kwargs: Any):
@@ -177,6 +249,9 @@ def _transcribe_request(payload: Mapping[str, Any]) -> dict[str, Any]:
         use_campp,
         campp_similarity_threshold,
     )
+    clusterer = model.cb_model if use_campp else None
+    if clusterer is not None and hasattr(clusterer, "reset_diagnostics"):
+        clusterer.reset_diagnostics()
     result, raw_speaker_turns = _generate_with_speaker_turn_capture(
         model,
         input=str(audio_path),
@@ -194,7 +269,6 @@ def _transcribe_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raw = {"text": str(raw)}
     sentence_info = raw.get("sentence_info") or []
-    clusterer = model.cb_model if use_campp else None
     speaker_turns, speaker_label_map = normalize_speaker_turns(
         raw_speaker_turns
     )
@@ -215,17 +289,50 @@ def _transcribe_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not segments and raw.get("timestamp") and raw.get("words"):
         timestamps = raw["timestamp"]
         words = raw["words"]
-        for pair, word in zip(timestamps, words):
-            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-                continue
-            segments.append(
-                {
-                    "start_sec": float(pair[0]) / 1000.0,
-                    "end_sec": float(pair[1]) / 1000.0,
-                    "text": str(word),
-                    "speaker": None,
-                }
+        valid_pairs = [
+            pair
+            for pair in timestamps
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        ]
+        if valid_pairs and len(valid_pairs) == len(words):
+            segments = sentence_info_to_segments(
+                [
+                    {
+                        "raw_text": words,
+                        "text": words,
+                        "start": valid_pairs[0][0],
+                        "end": valid_pairs[-1][1],
+                        "timestamp": valid_pairs,
+                        "spk": None,
+                    }
+                ],
+                speaker_turns,
+                speaker_label_map,
             )
+        if not segments:
+            for pair, word in zip(timestamps, words):
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                start_sec = float(pair[0]) / 1000.0
+                end_sec = float(pair[1]) / 1000.0
+                best_speaker = None
+                best_overlap = 0.0
+                for turn in speaker_turns:
+                    overlap = min(end_sec, float(turn["end_sec"])) - max(
+                        start_sec,
+                        float(turn["start_sec"]),
+                    )
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_speaker = turn.get("speaker")
+                segments.append(
+                    {
+                        "start_sec": start_sec,
+                        "end_sec": end_sec,
+                        "text": str(word),
+                        "speaker": best_speaker,
+                    }
+                )
     return {
         "ok": True,
         "language": language,
@@ -238,6 +345,12 @@ def _transcribe_request(payload: Mapping[str, Any]) -> dict[str, Any]:
             "similarity_threshold": campp_similarity_threshold,
             "embedding_count": len(getattr(clusterer, "last_labels", ())),
             "embedding_labels": list(getattr(clusterer, "last_labels", ())),
+            "cluster_algorithm_status": str(
+                getattr(clusterer, "last_cluster_status", "unavailable")
+            ),
+            "cluster_similarity": dict(
+                getattr(clusterer, "last_cluster_quality", {})
+            ),
             "embedding_cluster_count": len(
                 set(getattr(clusterer, "last_labels", ()))
             ),
@@ -266,6 +379,185 @@ def _transcribe_request(payload: Mapping[str, Any]) -> dict[str, Any]:
                 str(raw): label for raw, label in speaker_label_map.items()
             },
         },
+    }
+
+
+def _speaker_embedding_for_clip(
+    model: Any,
+    clip: Any,
+    sample_rate: int,
+    clip_id: str,
+):
+    import numpy as np
+
+    # CAM++ diarization uses 1.5-second windows.  Preserve the exact requested
+    # speech interval, padding only when it is shorter than one model window so
+    # adjacent role speech cannot leak into the verification clip.
+    target_samples = int(round(1.5 * sample_rate))
+    if clip.size < target_samples:
+        padding = target_samples - clip.size
+        clip = np.pad(clip, (padding // 2, padding - padding // 2))
+    result = model.generate(
+        input=[clip],
+        data_type="sound",
+        fs=sample_rate,
+        batch_size=1,
+        disable_pbar=True,
+    )
+    if not result or not isinstance(result[0], Mapping):
+        raise RuntimeError("CAM++ returned no speaker embedding")
+    embedding = result[0].get("spk_embedding")
+    if embedding is None:
+        raise RuntimeError("CAM++ speaker embedding is unavailable")
+    if hasattr(embedding, "detach"):
+        values = embedding.detach().float().cpu().numpy()
+    else:
+        values = np.asarray(embedding, dtype="float32")
+    values = np.asarray(values, dtype="float32")
+    if values.ndim == 1:
+        vector = values
+    elif values.ndim >= 2:
+        vector = values.reshape(-1, values.shape[-1]).mean(axis=0)
+    else:
+        raise RuntimeError("CAM++ speaker embedding has invalid shape")
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise RuntimeError("CAM++ speaker embedding has zero norm")
+    return vector / norm
+
+
+def _score_speaker_segments_request(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract independent role-clip embeddings and return pairwise scores."""
+
+    import numpy as np
+    import soundfile
+
+    audio_path = Path(str(payload["audio_path"]))
+    model_name = str(payload.get("model_name") or "iic/SenseVoiceSmall")
+    device = str(payload.get("device") or "cuda")
+    language = str(payload.get("language") or "auto")
+    use_campp = bool(payload.get("use_campp", True))
+    if not use_campp:
+        raise ValueError("CAM++ must be enabled for speaker verification")
+    campp_similarity_threshold = float(
+        payload.get("campp_similarity_threshold") or 0.78
+    )
+    same_speaker_threshold = float(
+        payload.get("same_speaker_threshold") or 0.55
+    )
+    different_speaker_threshold = float(
+        payload.get("different_speaker_threshold") or 0.30
+    )
+    requests = payload.get("clips") or ()
+    if not isinstance(requests, (list, tuple)):
+        raise ValueError("clips must be an array")
+    if len(requests) > 32:
+        raise ValueError("too many speaker verification clips")
+
+    audio, sample_rate = soundfile.read(
+        str(audio_path),
+        dtype="float32",
+        always_2d=True,
+    )
+    mono = np.asarray(audio, dtype="float32").mean(axis=1)
+    sample_rate = int(sample_rate)
+    if sample_rate <= 0 or mono.size == 0:
+        raise ValueError("speaker verification audio is empty")
+    duration_sec = mono.size / sample_rate
+    model = _load_speaker_verification_model(device)
+
+    clips: list[dict[str, Any]] = []
+    embeddings: dict[str, Any] = {}
+    for item in requests:
+        if not isinstance(item, Mapping):
+            continue
+        clip_id = str(item.get("clip_id") or "")
+        try:
+            start_sec = float(item["start_sec"])
+            end_sec = float(item["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            clips.append(
+                {
+                    "clip_id": clip_id,
+                    "quality_valid": False,
+                    "error": "invalid_clip_interval",
+                }
+            )
+            continue
+        clip_start = max(0.0, start_sec)
+        clip_end = min(duration_sec, end_sec)
+        start_sample = int(round(clip_start * sample_rate))
+        end_sample = int(round(clip_end * sample_rate))
+        clip = np.asarray(mono[start_sample:end_sample], dtype="float32")
+        raw_duration_sec = clip.size / sample_rate
+        rms = float(
+            np.sqrt(np.mean(np.square(clip))) if clip.size else 0.0
+        )
+        peak = float(np.max(np.abs(clip))) if clip.size else 0.0
+        clipping_fraction = float(
+            np.mean(np.abs(clip) >= 0.999) if clip.size else 0.0
+        )
+        quality_valid = (
+            bool(clip_id)
+            and raw_duration_sec >= 0.75
+            and rms >= 0.005
+            and clipping_fraction <= 0.15
+        )
+        record: dict[str, Any] = {
+            "clip_id": clip_id,
+            "clip_start_sec": round(clip_start, 6),
+            "clip_end_sec": round(clip_end, 6),
+            "duration_sec": round(raw_duration_sec, 6),
+            "sample_rate": sample_rate,
+            "rms": round(rms, 8),
+            "peak": round(peak, 8),
+            "clipping_fraction": round(clipping_fraction, 8),
+            "quality_valid": quality_valid,
+        }
+        if not quality_valid:
+            record["error"] = "clip_failed_acoustic_quality_gate"
+            clips.append(record)
+            continue
+        try:
+            embeddings[clip_id] = _speaker_embedding_for_clip(
+                model,
+                clip,
+                sample_rate,
+                clip_id,
+            )
+        except Exception as exc:
+            record["quality_valid"] = False
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        clips.append(record)
+
+    valid_ids = [
+        str(item["clip_id"])
+        for item in clips
+        if item.get("quality_valid") and str(item.get("clip_id") or "") in embeddings
+    ]
+    pairs = []
+    for left_index, left_id in enumerate(valid_ids):
+        for right_id in valid_ids[left_index + 1 :]:
+            pairs.append(
+                {
+                    "left_clip_id": left_id,
+                    "right_clip_id": right_id,
+                    "cosine_similarity": round(
+                        float(np.dot(embeddings[left_id], embeddings[right_id])),
+                        6,
+                    ),
+                }
+            )
+    return {
+        "ok": True,
+        "backend": "campp_direct_voiceprint",
+        "model": "iic/speech_campplus_sv_zh-cn_16k-common",
+        "device": device,
+        "language": language,
+        "same_speaker_threshold": same_speaker_threshold,
+        "different_speaker_threshold": different_speaker_threshold,
+        "clips": clips,
+        "pairs": pairs,
     }
 
 
@@ -528,6 +820,8 @@ def _request(payload: Mapping[str, Any]) -> dict[str, Any]:
         return _transcribe_request(payload)
     if action == "score_candidates":
         return _score_candidates_request(payload)
+    if action == "score_speaker_segments":
+        return _score_speaker_segments_request(payload)
     raise ValueError(f"unsupported SenseVoice worker action: {action}")
 
 

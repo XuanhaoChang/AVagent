@@ -54,7 +54,8 @@ so that a reviewer can trace a result back to its source.
 | --- | --- | --- |
 | GPT-A | Extracting prompt requirements and expected entities | A visual or audio defect in the video |
 | ASR and constrained candidate scoring | Spoken content, word substitutions, speaker turns | Ground-truth semantics without context |
-| OCR | Visible text, subtitles, logos, and text mismatches | Audio transcription |
+| OCR | Proposing locations and candidate strings for visible text | Proof that a detected shape is text, or that scene text is a subtitle |
+| OCR visual gate | Classifying OCR crops as subtitles, scene text/UI, logos, or non-text texture | Inventing issues that were not proposed by Auralis |
 | Gemini / Auralis | Evidence-aware multimodal judgment and issue wording | A substitute for missing evidence |
 | CAM++ / speaker tracks | Voice-to-entity consistency checks | Absolute speaker identity without prompt context |
 | AVBench / SyncNet | Audio-video synchronization | A defect from a raw score or boundary hit alone |

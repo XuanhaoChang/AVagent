@@ -21,6 +21,9 @@ Auralis 是项目中的专用音频与字幕子智能体。程序处理每条视
   SenseVoice CTC 成对分数；不依赖引号、角色冒号或固定字段。
 - `schemas.py`：稳定的输入、证据和输出结构。
 - `gemini_backend.py`：Gemini 网关 Judge；不承担 ASR、OCR 或音画同步。
+- `../ocr_visual_verifier.py`：把非确定性的 OCR 文字结论视为候选，回到原始高清帧和
+  OCR 局部框判断它究竟是字幕、场景文字/UI、logo 还是非文字纹理；未经支持的候选
+  不进入最终必保留并集。
 - `runner.py`：当前 GPT-A + Auralis + AVBench + 最终 GPT 汇总的 CSV 执行入口。
 - `../avbench_sync.py`：固定调用 AVBench SyncNet 的单视频适配器；它在 `.conda-envs/avbench` 子进程中复用模型，不把 PyTorch 依赖带入 ASR/OCR 环境。
 - `/tools/speech_transcription`：SenseVoice-Small + CAM++ 本地 ASR/说话人分离。
@@ -89,6 +92,6 @@ python call_ffmpeg_skill_gpt_d.py \
   --run-log output/benchmark/runs/gpt/auralis/run.jsonl
 ```
 
-该入口先运行 GPT-A，再对每条样本无条件调用 Auralis 和 AVBench，最后用一次纯文本 GPT
-对三路候选问题去重和整理。`用户反馈`和`思考过程及标准答案`都不会发送给
-Auralis、AVBench 或最终汇总器。
+该入口先运行 GPT-A，再对每条样本无条件调用 Auralis 和 AVBench。Auralis 中非确定性的
+OCR 文字问题先经过独立高清视觉门控，随后才由一次纯文本 GPT 对各路已采信问题去重和整理。
+`用户反馈`和`思考过程及标准答案`都不会发送给 Auralis、OCR 视觉门控、AVBench 或最终汇总器。

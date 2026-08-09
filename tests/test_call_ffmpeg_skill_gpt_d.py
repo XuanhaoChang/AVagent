@@ -1,8 +1,10 @@
 import csv
+import io
 import json
 import tempfile
 import unittest
 import urllib.error
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -287,6 +289,73 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
         )
         self.assertIn("未检测到音轨", parts[-1]["text"])
         self.assertFalse(any("inline_data" in part for part in parts))
+
+    def test_user_content_adds_role_labelled_voice_check_clip(self):
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(16000)
+            target.writeframes(b"\x00\x00" * 32000)
+        evidence = {
+            "asr": {
+                "metadata": {
+                    "prompt_speech_plan": {
+                        "role_reference_images": {"林止": [2]},
+                    },
+                    "speaker_binding_evidence": {
+                        "prompt_turn_alignment": [
+                            {
+                                "role": "林止",
+                                "dialogue_text": "别碰我！放开！",
+                                "observed_text": "别碰我放开",
+                                "status": "anchored",
+                                "anchor_method": "dialogue_text_similarity",
+                                "actual_speakers": [0],
+                                "matched_segments": [
+                                    {
+                                        "start_sec": 0.25,
+                                        "end_sec": 1.25,
+                                        "speaker": 0,
+                                        "text": "别碰我放开",
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+        prompt = (
+            '林止急喊：“别碰我！放开！”\n'
+            '视频角色对照表: 林止=【图2】'
+        )
+
+        parts = runner.build_user_content(
+            reference_images=[
+                "data:image/jpeg;base64,cmVmMQ==",
+                "data:image/jpeg;base64,cmVmMg==",
+            ],
+            video_frames=[],
+            audio_wav=wav_buffer.getvalue(),
+            audio_duration_sec=2.0,
+            user_prompt=prompt,
+            local_evidence_json=runner.json.dumps(evidence, ensure_ascii=False),
+        )
+
+        text_parts = [part["text"] for part in parts if "text" in part]
+        self.assertTrue(any("对应角色=林止" in text for text in text_parts))
+        self.assertTrue(any("角色声线核查" in text and "林止" in text for text in text_parts))
+        wav_parts = [
+            part["inline_data"]
+            for part in parts
+            if part.get("inline_data", {}).get("mime_type") == "audio/wav"
+        ]
+        self.assertEqual(len(wav_parts), 2)
+        clip = runner.base64.b64decode(wav_parts[0]["data"])
+        with wave.open(io.BytesIO(clip), "rb") as source:
+            duration_sec = source.getnframes() / source.getframerate()
+        self.assertAlmostEqual(duration_sec, 1.0, places=2)
 
     def test_chat_payload_uses_gemini_contents_on_existing_endpoint(self):
         parts = [{"text": "test"}]
@@ -945,9 +1014,14 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
             "关键帧秒": "",
             "BBox": "",
         }
+        fact_id = runner.build_synthesis_fact_registry([required])[0]["fact_id"]
+        organized_with_coverage = {
+            **organized,
+            "covered_fact_ids": [fact_id],
+        }
         with mock.patch(
             "agents.auralis.runner.final_chat_completion",
-            return_value=json.dumps([organized], ensure_ascii=False),
+            return_value=json.dumps([organized_with_coverage], ensure_ascii=False),
         ):
             result = runner.synthesize_predictions(
                 user_prompt="不要降低画质",
@@ -963,6 +1037,90 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
             )
 
         self.assertEqual(json.loads(result), [organized])
+
+    def test_fact_coverage_does_not_reappend_rephrased_missing_caption(self):
+        required = {
+            "可定位性": "否",
+            "置信度": "高",
+            "问题说明": (
+                "预期在 4.18s - 5.14s 处显示与实际语音“5点到头了”相吻合的"
+                "台词字幕，实际视频画面中并未提供该台词字幕，导致字幕缺失且"
+                "与实际语音不一致。"
+            ),
+            "问题类型": "文字质量问题",
+            "时间区间": "4.18s - 5.14s",
+            "关键帧秒": "",
+            "BBox": "",
+        }
+        organized = {
+            **required,
+            "问题说明": (
+                "4.18s - 5.14s 处实际语音为“5点到头了”，但视频画面中未提供"
+                "与该语音相吻合的台词字幕，存在字幕缺失且与实际语音不一致的问题。"
+            ),
+        }
+        fact_id = runner.build_synthesis_fact_registry([required])[0]["fact_id"]
+        response_issue = {
+            **organized,
+            "covered_fact_ids": [fact_id],
+        }
+        stats = {}
+
+        with mock.patch(
+            "agents.auralis.runner.final_chat_completion",
+            return_value=json.dumps([response_issue], ensure_ascii=False),
+        ):
+            result = runner.synthesize_predictions(
+                user_prompt="检查视频",
+                gpt_a_prediction="[]",
+                auralis_prediction=json.dumps([required], ensure_ascii=False),
+                api_url="https://example.test/chat/completions",
+                api_key="token",
+                model="gpt-model",
+                timeout=30,
+                api_retries=1,
+                run_stats=stats,
+                deterministic_issues=[required],
+            )
+
+        self.assertEqual(json.loads(result), [organized])
+        self.assertEqual(stats["covered_fact_ids"], [fact_id])
+        self.assertEqual(stats["missing_fact_ids"], [])
+
+    def test_fact_coverage_appends_only_a_truly_missing_fact(self):
+        first = {
+            "可定位性": "否",
+            "置信度": "高",
+            "问题说明": "实际存在字幕缺失。",
+            "问题类型": "文字质量问题",
+            "时间区间": "1.00s - 2.00s",
+            "关键帧秒": "",
+            "BBox": "",
+        }
+        second = {
+            **first,
+            "问题说明": "实际存在角色声音绑定错误。",
+            "问题类型": "音频质量问题",
+            "时间区间": "3.00s - 4.00s",
+        }
+        registry = runner.build_synthesis_fact_registry([first, second])
+        first_id = next(
+            record["fact_id"] for record in registry if record["issue"] == first
+        )
+        organized = {**first, "covered_fact_ids": [first_id]}
+        stats = {}
+
+        preserved = json.loads(
+            runner.preserve_synthesis_fact_coverage(
+                [{key: organized[key] for key in runner.OUTPUT_KEYS}],
+                [organized["covered_fact_ids"]],
+                registry,
+                run_stats=stats,
+            )
+        )
+
+        self.assertEqual(preserved, [first, second])
+        self.assertEqual(len(stats["missing_fact_ids"]), 1)
 
     def test_prediction_rejects_issue_without_required_evidence(self):
         with self.assertRaisesRegex(ValueError, "问题说明"):

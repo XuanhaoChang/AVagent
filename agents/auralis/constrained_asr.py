@@ -32,6 +32,22 @@ MAX_CONTEXT_CHARACTERS = 72
 MAX_CONTEXT_GAP_SEC = 1.25
 MAX_SCORE_CANDIDATES = 12
 DEFAULT_DECISION_DELTA = 0.70
+_SPEECH_CUE_FRAGMENTS = {
+    "说",
+    "说道",
+    "说到",
+    "道",
+    "问",
+    "问道",
+    "回答",
+    "喊",
+    "喊道",
+    "大喊",
+    "高喊",
+    "急喊",
+    "低声说",
+    "大声说",
+}
 _ISSUE_TIME_RANGE = re.compile(
     r"^\s*(?P<start>\d+(?:\.\d+)?)s\s*-\s*"
     r"(?P<end>\d+(?:\.\d+)?)s\s*$"
@@ -151,6 +167,36 @@ def _difference_signatures(anchor: Mapping[str, Any]) -> set[tuple[Any, ...]]:
             )
         )
     return signatures
+
+
+def _prompt_speech_cue_boundary_artifact(anchor: Mapping[str, Any]) -> bool:
+    """Detect a narration cue accidentally aligned as a spoken first word."""
+
+    source = str(anchor.get("prompt_source_text") or "")
+    colon_indexes = [
+        index for index in (source.find("："), source.find(":")) if index >= 0
+    ]
+    if not colon_indexes:
+        return False
+    colon_index = min(colon_indexes)
+    cue, _ = normalize_reference_text(source[:colon_index])
+    if cue not in _SPEECH_CUE_FRAGMENTS:
+        return False
+    expected = str(anchor.get("expected_text") or "")
+    observed = str(anchor.get("observed_text") or "")
+    if not cue or not expected.startswith(cue):
+        return False
+    expected_body = expected[len(cue) :]
+    if len(expected_body) < MIN_REFERENCE_CHARACTERS or not observed.endswith(expected_body):
+        return False
+    differences = [
+        item for item in anchor.get("differences", ()) if isinstance(item, Mapping)
+    ]
+    return bool(differences) and all(
+        int(item.get("expected_end") or 0) <= len(cue)
+        and int(item.get("observed_end") or 0) <= max(len(cue), 1)
+        for item in differences
+    )
 
 
 def _segments_can_share_context(
@@ -365,7 +411,23 @@ def extract_prompt_reference_candidates(
     for anchor_index, anchor in enumerate(anchors, start=1):
         anchor["candidate_id"] = f"prompt-asr-{anchor_index:03d}"
 
-    candidates = [item for item in anchors if item["differences"]]
+    suppressed_candidates = []
+    candidates = []
+    for item in anchors:
+        if not item["differences"]:
+            continue
+        if _prompt_speech_cue_boundary_artifact(item):
+            suppressed_candidates.append(
+                {
+                    **dict(item),
+                    "decision": "prompt_boundary_artifact",
+                    "suppression_reason": (
+                        "prompt_narration_speech_cue_is_not_dialogue_audio"
+                    ),
+                }
+            )
+            continue
+        candidates.append(item)
     candidates.sort(
         key=lambda item: (
             -float(item["alignment_similarity"]),
@@ -397,6 +459,7 @@ def extract_prompt_reference_candidates(
         "candidate_count": len(candidates),
         "anchors": anchors,
         "candidates": candidates,
+        "suppressed_candidates": suppressed_candidates,
     }
 
 
@@ -443,7 +506,7 @@ def evaluate_prompt_constrained_asr(
     if not candidates:
         return {
             **extraction,
-            "candidate_scores": [],
+            "candidate_scores": list(extraction.get("suppressed_candidates", ())),
         }
     threshold = _decision_delta()
     try:
@@ -528,7 +591,10 @@ def evaluate_prompt_constrained_asr(
             response.get("backend") or "sensevoice_constrained_ctc"
         ),
         "decision_threshold_log_likelihood": threshold,
-        "candidate_scores": merged_scores,
+        "candidate_scores": sorted(
+            merged_scores + list(extraction.get("suppressed_candidates", ())),
+            key=lambda item: float(item.get("start_sec") or 0.0),
+        ),
     }
 
 
@@ -599,6 +665,7 @@ def filter_contradicted_judge_issues(
         "orthographic_homophone",
         "ambiguous",
         "pronunciation_unverified",
+        "prompt_boundary_artifact",
         "scoring_failed",
     }
     blocked_scores = [

@@ -48,6 +48,12 @@ class AuralisGeminiBackendTest(unittest.TestCase):
         self.assertIn("speaker_diarization.speaker_turns", SYSTEM_MESSAGE)
         self.assertIn("granularity_conflict=true", SYSTEM_MESSAGE)
         self.assertIn("单个采样帧中孤立出现的单字符 OCR", SYSTEM_MESSAGE)
+        self.assertIn("role_reference_images", SYSTEM_MESSAGE)
+        self.assertIn("角色声线核查片段", SYSTEM_MESSAGE)
+        self.assertIn("独立于 CAM++ 聚类", SYSTEM_MESSAGE)
+        self.assertIn("必须输出为不同问题对象", SYSTEM_MESSAGE)
+        self.assertIn("不能证明该声音属于男主", SYSTEM_MESSAGE)
+        self.assertIn("speaker_evidence_policy.binding_actionable=false", SYSTEM_MESSAGE)
         self.assertNotIn("思考过程及标准答案", prompt)
 
     def test_local_evidence_exposes_prompt_anchored_candidate_decision(self):
@@ -59,6 +65,20 @@ class AuralisGeminiBackendTest(unittest.TestCase):
                 backend="fake",
                 model="fake",
                 device="cpu",
+                metadata={
+                    "prompt_speech_plan": {"scope": "partial"},
+                    "speaker_binding_evidence": {
+                        "status": "fine_grained_turns",
+                        "prompt_scope": "partial",
+                        "prompt_turn_alignment": [
+                            {
+                                "role": "李莲",
+                                "actual_speakers": [0],
+                                "status": "anchored",
+                            }
+                        ],
+                    },
+                },
             ),
             subtitles=SubtitleTrack(segments=(), backend="fake"),
             alignment=AlignmentResult(issues=()),
@@ -102,6 +122,20 @@ class AuralisGeminiBackendTest(unittest.TestCase):
                 backend="fake",
                 model="fake",
                 device="cpu",
+                metadata={
+                    "prompt_speech_plan": {"scope": "partial"},
+                    "speaker_binding_evidence": {
+                        "status": "fine_grained_turns",
+                        "prompt_scope": "partial",
+                        "prompt_turn_alignment": [
+                            {
+                                "role": "李莲",
+                                "actual_speakers": [0],
+                                "status": "anchored",
+                            }
+                        ],
+                    },
+                },
             ),
             subtitles=SubtitleTrack(segments=(), backend="fake"),
             alignment=AlignmentResult(issues=()),
@@ -111,6 +145,60 @@ class AuralisGeminiBackendTest(unittest.TestCase):
 
         self.assertEqual(payload["asr"]["segments"][0]["speaker"], 0)
         self.assertEqual(payload["asr"]["segments"][1]["speaker"], 1)
+        self.assertTrue(
+            payload["asr"]["metadata"]["speaker_evidence_policy"][
+                "binding_actionable"
+            ]
+        )
+
+    def test_local_evidence_hides_unavailable_raw_speaker_labels_from_judge(self):
+        evidence = AuralisEvidence(
+            media_metadata={"has_audio": True, "duration_sec": 2.0},
+            transcript=SpeechTranscript(
+                language="zh",
+                segments=(
+                    SpeechSegment(0.0, 1.0, "小心别掉了", "medium", speaker=2),
+                ),
+                backend="fake",
+                model="fake",
+                device="cpu",
+                metadata={
+                    "prompt_speech_plan": {"scope": "none"},
+                    "speaker_binding_evidence": {
+                        "status": "unavailable",
+                        "prompt_scope": "none",
+                        "prompt_turn_alignment": [],
+                    },
+                    "raw_sentence_info": [
+                        {"text": "小心别掉了", "start": 0, "end": 1000, "spk": 2}
+                    ],
+                    "speaker_diarization": {
+                        "speaker_turns": [
+                            {"start_sec": 0.0, "end_sec": 1.0, "speaker": 2}
+                        ],
+                        "segments": [
+                            {"start_sec": 0.0, "end_sec": 1.0, "speaker": 2}
+                        ],
+                    },
+                    "clustering": {
+                        "embedding_labels": [2],
+                        "raw_to_anonymous_label": {"2": 2},
+                        "cluster_similarity": {"2": {"window_count": 1}},
+                    },
+                },
+            ),
+            subtitles=SubtitleTrack(segments=(), backend="fake"),
+            alignment=AlignmentResult(issues=()),
+        )
+
+        payload = json.loads(evidence_json(evidence))
+        metadata = payload["asr"]["metadata"]
+
+        self.assertIsNone(payload["asr"]["segments"][0]["speaker"])
+        self.assertNotIn("spk", metadata["raw_sentence_info"][0])
+        self.assertEqual(metadata["speaker_diarization"]["speaker_turns"], [])
+        self.assertEqual(metadata["clustering"]["embedding_labels"], [])
+        self.assertFalse(metadata["speaker_evidence_policy"]["binding_actionable"])
 
     def test_payload_uses_gateway_compatible_gemini_contents(self):
         payload = build_chat_payload("gemini-3.5-flash", [{"text": "test"}])
