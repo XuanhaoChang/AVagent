@@ -26,11 +26,8 @@ from av_eval.text_review import (
 )
 
 
-DEFAULT_API_URL = (
-    "https://sd8fq9c4cuac30otu789g.apigateway-cn-beijing.volceapi.com/"
-    "ark-router/v1/chat/completions"
-)
-DEFAULT_MODEL = "gpt-5.5-2026-04-24"
+DEFAULT_API_URL = ""
+DEFAULT_MODEL = ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,11 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--api-url",
-        default=os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        default=os.getenv(
+            "AVAGENT_API_URL",
+            os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        ),
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("VIDEO_EVAL_MODEL", DEFAULT_MODEL),
+        default=os.getenv(
+            "AVAGENT_REVIEW_MODEL",
+            os.getenv("VIDEO_EVAL_MODEL", DEFAULT_MODEL),
+        ),
     )
     parser.add_argument("--start", type=int, default=1, help="从第几个样本开始。")
     parser.add_argument("--limit", type=int, default=0, help="处理数量；0 表示全部。")
@@ -177,7 +180,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"dry-run: validated {len(selected)} samples; no API request sent")
         return 0
 
-    api_key = os.getenv("ARK_API_KEY", "").strip()
+    api_key = (
+        os.getenv("AVAGENT_API_KEY", "").strip()
+        or os.getenv("ARK_API_KEY", "").strip()
+    )
 
     existing = (
         _read_existing(args.output_jsonl, prediction_sources)
@@ -206,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             started = time.monotonic()
             if not api_key:
                 raise ValueError(
-                    "缺少 ARK_API_KEY；请检查项目根目录 .env.local"
+                    "缺少 AVAGENT_API_KEY；请检查项目根目录 .env.local"
                 )
             text, usage, request_bytes = chat_completion(
                 api_url=args.api_url,

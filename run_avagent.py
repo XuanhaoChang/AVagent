@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entry point for the Auralis audio specialist agent."""
+"""Public command-line entry point for the AVAgent evaluation pipeline."""
 
 import base64
 import json
@@ -7,7 +7,8 @@ import time
 import urllib
 from typing import Any, Dict
 
-import call_ffmpeg_skill as gpt_a
+import run_visual_baseline as gpt_a
+from agents.classic_checks.contracts import EvaluationResult
 from agents.auralis.gemini_backend import (
     DEFAULT_MODEL,
     OUTPUT_KEYS,
@@ -41,6 +42,7 @@ from agents.auralis.runner import (
     build_synthesis_fact_registry,
     build_synthesis_prompt,
     build_avbench_runner,
+    build_classic_stage_results,
     deduplicate_prediction_issues,
     evaluate_visual_metadata_constraints,
     extract_visual_metadata_constraints,
@@ -48,6 +50,7 @@ from agents.auralis.runner import (
     gate_auralis_ocr_prediction,
     metadata_constraint_issues,
     preserve_synthesis_fact_coverage,
+    record_classic_evaluation,
     run_avbench_row,
     select_evidence_backed_gpt_a_issues,
     synthesize_predictions,
@@ -125,10 +128,14 @@ def run_combined_row(
     avbench_runner: Any | None = None,
 ) -> str:
     """Backward-compatible wrapper whose two calls remain independently patchable."""
+    stats_sink = run_stats if run_stats is not None else {}
     metadata_issues = evaluate_visual_metadata_constraints(
         gpt_a_input,
-        run_stats=run_stats,
+        run_stats=stats_sink,
     )
+    metadata_stats = stats_sink.get("visual_metadata_constraints", {})
+    if not isinstance(metadata_stats, dict):
+        metadata_stats = {}
     gpt_a_stats: Dict[str, Any] = {}
     gpt_a_prediction = ""
     gpt_a_error: Exception | None = None
@@ -197,6 +204,44 @@ def run_combined_row(
         run_stats["request_bytes"] = int(
             gpt_a_stats.get("request_bytes", 0)
         ) + int(auralis_stats.get("request_bytes", 0))
+    if (
+        gpt_a_error is not None
+        or auralis_error is not None
+        or avbench_error is not None
+    ):
+        failed_stage_results = build_classic_stage_results(
+            metadata_issues=metadata_issues,
+            metadata_stats=metadata_stats,
+            gpt_a_issues=[
+                issue
+                for issue in gpt_a_stats.get("raw_prediction", ())
+                if isinstance(issue, dict)
+            ],
+            gpt_a_stats=gpt_a_stats,
+            gpt_a_error=gpt_a_error,
+            seed_lite_issues=(),
+            seed_lite_stats={},
+            seed_lite_enabled=False,
+            seed_lite_error=None,
+            auralis_issues=[
+                issue
+                for issue in auralis_stats.get("auralis_issues", ())
+                if isinstance(issue, dict)
+            ],
+            auralis_stats=auralis_stats,
+            auralis_error=auralis_error,
+            avbench_result=avbench_result,
+            avbench_stats=avbench_stats,
+            avbench_error=avbench_error,
+            ocr_visual_stats={},
+            ocr_visual_executed=False,
+        )
+        record_classic_evaluation(
+            gpt_a_input,
+            audio_input,
+            failed_stage_results,
+            run_stats=run_stats,
+        )
     if gpt_a_error is not None and auralis_error is not None:
         raise RuntimeError(
             f"GPT-A 失败：{gpt_a_error}；Auralis 失败：{auralis_error}"
@@ -216,11 +261,11 @@ def run_combined_row(
         model=gpt_a_model,
         timeout=timeout,
         api_retries=api_retries,
-        run_stats=run_stats,
+        run_stats=stats_sink,
     )
     ocr_visual_stats = (
-        run_stats.get("ocr_visual_verifier", {})
-        if isinstance(run_stats, dict)
+        stats_sink.get("ocr_visual_verifier", {})
+        if isinstance(stats_sink, dict)
         else {}
     )
     deduplicated_audio_prediction = deduplicate_prediction_issues(
@@ -241,6 +286,35 @@ def run_combined_row(
         )
         if isinstance(issue, dict)
     )
+    stage_results = build_classic_stage_results(
+        metadata_issues=metadata_issues,
+        metadata_stats=metadata_stats,
+        gpt_a_issues=[
+            issue
+            for issue in gpt_a_stats.get("raw_prediction", ())
+            if isinstance(issue, dict)
+        ],
+        gpt_a_stats=gpt_a_stats,
+        gpt_a_error=gpt_a_error,
+        seed_lite_issues=(),
+        seed_lite_stats={},
+        seed_lite_enabled=False,
+        seed_lite_error=None,
+        auralis_issues=auralis_stats.get("deduplicated_issues", ()),
+        auralis_stats=auralis_stats,
+        auralis_error=auralis_error,
+        avbench_result=avbench_result,
+        avbench_stats=avbench_stats,
+        avbench_error=avbench_error,
+        ocr_visual_stats=ocr_visual_stats,
+        ocr_visual_executed=True,
+    )
+    classic_evaluation = record_classic_evaluation(
+        gpt_a_input,
+        audio_input,
+        stage_results,
+        run_stats=run_stats,
+    )
     final_stats: Dict[str, Any] = {}
     if run_stats is not None:
         run_stats["final_synthesis"] = final_stats
@@ -259,8 +333,9 @@ def run_combined_row(
         run_stats=final_stats,
         deterministic_issues=required_issues,
     )
+    final_issues = json.loads(final_prediction)
     if run_stats is not None:
-        run_stats["final_prediction"] = json.loads(final_prediction)
+        run_stats["final_prediction"] = final_issues
         run_stats["api_calls"] = sum(
             int(stats.get("api_calls", 0))
             for stats in (
@@ -279,6 +354,12 @@ def run_combined_row(
                 final_stats,
             )
         )
+    classic_evaluation = EvaluationResult(
+        checks=classic_evaluation.checks,
+        final_issues=tuple(final_issues),
+        tool_trace=classic_evaluation.tool_trace,
+        compatibility_log=classic_evaluation.compatibility_log,
+    )
     return final_prediction
 
 

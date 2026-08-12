@@ -1,0 +1,2 @@
+# AVAgent additions on top of third_party/AVBench/requirements.txt.
+scenedetect==0.6.1

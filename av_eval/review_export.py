@@ -132,7 +132,7 @@ def attach_auralis_evidence_to_review_samples(
     samples_root: Path,
     replace: bool = False,
 ) -> int:
-    """Attach auditable ASR/OCR evidence from an Agent-D JSONL run log.
+    """Attach auditable ASR/OCR evidence from an AVAgent JSONL run log.
 
     The run log may contain more rows than ``samples_root`` (for example, a
     selected-sample run writes a source-shaped CSV).  Evidence is matched by
@@ -140,7 +140,7 @@ def attach_auralis_evidence_to_review_samples(
     """
 
     if not run_log.is_file():
-        raise FileNotFoundError(f"Agent-D run log 不存在：{run_log}")
+        raise FileNotFoundError(f"AVAgent run log 不存在：{run_log}")
     records_by_id: dict[str, dict[str, Any]] = {}
     for line_number, line in enumerate(
         run_log.read_text(encoding="utf-8").splitlines(), start=1

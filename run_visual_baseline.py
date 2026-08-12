@@ -26,7 +26,7 @@ INPUT_DIR = BASE_DIR / "input"
 INPUT_CSV = INPUT_DIR / "gt.csv"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_CSV = OUTPUT_DIR / "pred.csv"
-SKILL_PATH = BASE_DIR / "SKILL.md"
+SKILL_PATH = BASE_DIR / "configs" / "evaluator_prompt.md"
 PREDICTION_COLUMN = "GPT预测结果"
 SOURCE_COLUMNS = [
     "序号",
@@ -43,12 +43,10 @@ INFERENCE_COLUMNS = [
     "generated_video_url",
     "用户反馈",
 ]
-DEFAULT_API_URL = (
-    "https://sd8fq9c4cuac30otu789g.apigateway-cn-beijing.volceapi.com/"
-    "ark-router/v1/chat/completions"
-)
-DEFAULT_MODEL = "gpt-5.5-2026-04-24"
-API_KEY_ENV = "ARK_API_KEY"
+DEFAULT_API_URL = ""
+DEFAULT_MODEL = ""
+API_KEY_ENV = "AVAGENT_API_KEY"
+LEGACY_API_KEY_ENV = "ARK_API_KEY"
 MAX_VISUAL_TOOL_CALLS = 4
 DEFAULT_VIDEO_FRAME_FPS = 2.0
 DEFAULT_VIDEO_FRAME_WIDTH = 384
@@ -227,7 +225,9 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="用 SKILL.md 标注 gt.csv，输出 pred.csv。")
+    parser = argparse.ArgumentParser(
+        description="使用 configs/evaluator_prompt.md 评测输入 CSV。"
+    )
     parser.add_argument(
         "--input-csv",
         type=Path,
@@ -238,12 +238,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=int, default=1, help="从第几条数据开始，默认 1。")
     parser.add_argument(
         "--api-url",
-        default=os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        default=os.getenv(
+            "AVAGENT_API_URL",
+            os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        ),
         help="OpenAI 兼容的 /chat/completions 完整地址。",
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("VIDEO_EVAL_MODEL", DEFAULT_MODEL),
+        default=os.getenv(
+            "AVAGENT_VISUAL_MODEL",
+            os.getenv("VIDEO_EVAL_MODEL", DEFAULT_MODEL),
+        ),
         help="远程 Chat Completions 模型名。",
     )
     parser.add_argument("--timeout", type=int, default=900, help="单次 HTTP 请求超时秒数。")
@@ -618,9 +624,12 @@ def filter_prediction_for_audio_mode(
 
 
 def require_api_key() -> str:
-    api_key = os.getenv(API_KEY_ENV, "").strip()
+    api_key = (
+        os.getenv(API_KEY_ENV, "").strip()
+        or os.getenv(LEGACY_API_KEY_ENV, "").strip()
+    )
     if not api_key:
-        raise ValueError(f"缺少环境变量 {API_KEY_ENV}；请设置为指定网关的 Bearer token。")
+        raise ValueError(f"缺少环境变量 {API_KEY_ENV}；请设置兼容网关的 Bearer token。")
     return api_key
 
 
@@ -1280,6 +1289,10 @@ def main() -> int:
     load_project_env(BASE_DIR / ".env.local")
     args = parse_args()
     api_key = require_api_key()
+    if not args.api_url:
+        raise ValueError("缺少 --api-url 或 AVAGENT_API_URL。")
+    if not args.model:
+        raise ValueError("缺少 --model 或 AVAGENT_VISUAL_MODEL。")
     table = read_csv(args.input_csv)
     if not table:
         raise ValueError("gt.csv 为空")

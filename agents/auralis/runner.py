@@ -17,8 +17,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
-import call_ffmpeg_skill as gpt_a
+import run_visual_baseline as gpt_a
 from agents.avbench_sync import AVBenchSyncRunner
+from agents.classic_checks.contracts import EvaluationResult, ToolResult
+from agents.classic_checks.harness import (
+    build_evaluation_sample,
+    evaluate_precomputed_tools,
+)
 from agents.auralis.agent import AuralisAgent
 from agents.auralis.constrained_asr import evaluate_prompt_constrained_asr
 from agents.auralis.gemini_backend import (
@@ -52,10 +57,10 @@ from tools.subtitle_extraction.tool import extract_subtitles
 BASE_DIR = Path(__file__).resolve().parents[2]
 INPUT_DIR = BASE_DIR / "input"
 INPUT_CSV = INPUT_DIR / "gt.csv"
-OUTPUT_CSV = BASE_DIR / "output" / "pred_gpt_d.csv"
+OUTPUT_CSV = BASE_DIR / "output" / "predictions.csv"
 DEFAULT_API_URL = gpt_a.DEFAULT_API_URL
 DEFAULT_GPT_A_MODEL = gpt_a.DEFAULT_MODEL
-API_KEY_ENV = "ARK_API_KEY"
+API_KEY_ENV = gpt_a.API_KEY_ENV
 PREDICTION_COLUMN = gpt_a.PREDICTION_COLUMN
 SOURCE_COLUMNS = gpt_a.SOURCE_COLUMNS
 INFERENCE_COLUMNS = (
@@ -1040,7 +1045,7 @@ def merge_predictions(
     )
 
 
-FINAL_SYNTHESIS_SYSTEM_MESSAGE = """你是 GPT-D 的最终结果整理器。
+FINAL_SYNTHESIS_SYSTEM_MESSAGE = """你是 AVAgent 的最终结果整理器。
 
 你会收到同一视频的用户 prompt、GPT-A 主评测结果、Auralis 音频/字幕专家结果、
 Seed-Lite 视觉物理专家结果、本地视频元数据约束检查结果和 AVBench 音画同步结果。GPT-A 是候选问题；Auralis 同时包含
@@ -1359,7 +1364,7 @@ def run_avbench_row(
     avbench_runner: AVBenchSyncRunner | Any | None = None,
     run_stats: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Mandatory single-video AVBench call for one Agent-D row."""
+    """Mandatory single-video AVBench call for one AVAgent row."""
     runner = avbench_runner or build_avbench_runner()
     video_path = gpt_a.ensure_video(str(input_data["generated_video_url"]))
     try:
@@ -1571,6 +1576,185 @@ def gate_auralis_ocr_prediction(
     return json.dumps(accepted, ensure_ascii=False)
 
 
+def _tool_usage(stats: Mapping[str, Any]) -> Dict[str, Any]:
+    usage = stats.get("usage", {})
+    return {
+        "api_calls": int(stats.get("api_calls", 0) or 0),
+        "request_bytes": int(stats.get("request_bytes", 0) or 0),
+        "usage": dict(usage) if isinstance(usage, Mapping) else {},
+    }
+
+
+def _stage_tool_result(
+    *,
+    status: str,
+    issues: Sequence[Mapping[str, Any]] = (),
+    stats: Mapping[str, Any] | None = None,
+    evidence_keys: Sequence[str] = (),
+    result: Mapping[str, Any] | None = None,
+    error: Exception | str | None = None,
+) -> ToolResult:
+    stage_stats = dict(stats or {})
+    evidence = {
+        key: stage_stats[key]
+        for key in evidence_keys
+        if key in stage_stats
+    }
+    artifacts: Dict[str, Any] = {
+        "issues": [dict(issue) for issue in issues if isinstance(issue, Mapping)]
+    }
+    if result is not None:
+        artifacts["result"] = dict(result)
+    reported_status = stage_stats.get("status", "")
+    diagnostics = {
+        "reported_status": reported_status,
+        "candidate_count": stage_stats.get("candidate_count", 0),
+        "accepted_issue_count": stage_stats.get("accepted_issue_count", 0),
+    }
+    error_text = str(error or stage_stats.get("error") or "")
+    return ToolResult(
+        status=status,
+        evidence=evidence,
+        artifacts=artifacts,
+        diagnostics=diagnostics,
+        error=error_text,
+        usage=_tool_usage(stage_stats),
+    )
+
+
+def build_classic_stage_results(
+    *,
+    metadata_issues: Sequence[Mapping[str, Any]],
+    metadata_stats: Mapping[str, Any],
+    gpt_a_issues: Sequence[Mapping[str, Any]],
+    gpt_a_stats: Mapping[str, Any],
+    gpt_a_error: Exception | None,
+    seed_lite_issues: Sequence[Mapping[str, Any]],
+    seed_lite_stats: Mapping[str, Any],
+    seed_lite_enabled: bool,
+    seed_lite_error: Exception | None,
+    auralis_issues: Sequence[Mapping[str, Any]],
+    auralis_stats: Mapping[str, Any],
+    auralis_error: Exception | None,
+    avbench_result: Mapping[str, Any],
+    avbench_stats: Mapping[str, Any],
+    avbench_error: Exception | None,
+    ocr_visual_stats: Mapping[str, Any],
+    ocr_visual_executed: bool,
+) -> Dict[str, ToolResult]:
+    """Translate existing pipeline stage outputs into the unified contract."""
+
+    metadata_status = (
+        "not_applicable"
+        if metadata_stats.get("status") == "not_requested"
+        else "ok"
+    )
+    if gpt_a_error is not None:
+        gpt_a_status = "failed"
+    else:
+        gpt_a_status = "ok"
+    if seed_lite_error is not None:
+        seed_lite_status = "failed"
+    elif not seed_lite_enabled:
+        seed_lite_status = "not_applicable"
+    else:
+        seed_lite_status = "ok"
+    if auralis_error is not None or auralis_stats.get("status") == "failed":
+        auralis_status = "failed"
+    elif auralis_stats.get("status") == "no_audio":
+        auralis_status = "not_applicable"
+    else:
+        auralis_status = "ok"
+    if avbench_error is not None or avbench_stats.get("status") == "failed":
+        avbench_status = "failed"
+    elif avbench_result.get("success") is False or str(
+        avbench_result.get("status") or ""
+    ) in {"no_audio", "not_evaluable"}:
+        avbench_status = "not_applicable"
+    else:
+        avbench_status = "ok"
+    if not ocr_visual_executed or ocr_visual_stats.get("status") == "not_needed":
+        ocr_status = "not_applicable"
+    elif ocr_visual_stats.get("status") == "failed":
+        ocr_status = "failed"
+    else:
+        ocr_status = "ok"
+
+    return {
+        "metadata": _stage_tool_result(
+            status=metadata_status,
+            issues=metadata_issues,
+            stats=metadata_stats,
+            evidence_keys=("constraints", "media_metadata"),
+        ),
+        "gpt_a": _stage_tool_result(
+            status=gpt_a_status,
+            issues=gpt_a_issues,
+            stats=gpt_a_stats,
+            evidence_keys=("evidence_backed_visual_issues", "tool_calls"),
+            error=gpt_a_error,
+        ),
+        "seed_lite": _stage_tool_result(
+            status=seed_lite_status,
+            issues=seed_lite_issues,
+            stats=seed_lite_stats,
+            evidence_keys=("candidate_reviews", "tool_calls"),
+            error=seed_lite_error,
+        ),
+        "auralis": _stage_tool_result(
+            status=auralis_status,
+            issues=auralis_issues,
+            stats=auralis_stats,
+            evidence_keys=(
+                "auralis_evidence",
+                "deterministic_issues",
+                "auralis_diagnostics",
+            ),
+            error=auralis_error,
+        ),
+        "avbench": _stage_tool_result(
+            status=avbench_status,
+            stats=avbench_stats,
+            result=avbench_result,
+            error=avbench_error,
+        ),
+        "ocr_visual_verifier": _stage_tool_result(
+            status=ocr_status,
+            stats=ocr_visual_stats,
+            evidence_keys=("candidate_reviews",),
+            error=ocr_visual_stats.get("error", ""),
+        ),
+    }
+
+
+def record_classic_evaluation(
+    gpt_a_input: Mapping[str, Any],
+    audio_input: Mapping[str, Any],
+    stage_results: Mapping[str, ToolResult],
+    *,
+    final_issues: Sequence[Mapping[str, Any]] = (),
+    run_stats: Dict[str, Any] | None = None,
+) -> EvaluationResult:
+    """Execute all classic checks and append only the two new log keys."""
+
+    sample = build_evaluation_sample(gpt_a_input, audio_input)
+    evaluation, serialized_tools = evaluate_precomputed_tools(
+        sample,
+        stage_results,
+        final_issues=final_issues,
+        compatibility_log={
+            "input_mode": "existing_pipeline_stage_order",
+            "required_issue_count": len(final_issues),
+        },
+    )
+    if run_stats is not None:
+        run_stats["classic_checks"] = [
+            check.to_dict() for check in evaluation.checks
+        ]
+        run_stats["tool_results"] = serialized_tools
+    return evaluation
+
+
 def run_combined_row(
     gpt_a_input: Dict[str, Any],
     audio_input: Dict[str, Any],
@@ -1588,10 +1772,14 @@ def run_combined_row(
     avbench_runner: AVBenchSyncRunner | Any | None = None,
     seed_lite_model: str | None = None,
 ) -> str:
+    stats_sink = run_stats if run_stats is not None else {}
     metadata_issues = evaluate_visual_metadata_constraints(
         gpt_a_input,
-        run_stats=run_stats,
+        run_stats=stats_sink,
     )
+    metadata_stats = stats_sink.get("visual_metadata_constraints", {})
+    if not isinstance(metadata_stats, Mapping):
+        metadata_stats = {}
     gpt_a_stats: Dict[str, Any] = {}
     gpt_a_prediction = ""
     gpt_a_error: Exception | None = None
@@ -1685,6 +1873,48 @@ def run_combined_row(
         ) + int(auralis_stats.get("request_bytes", 0)) + int(
             seed_lite_stats.get("request_bytes", 0)
         )
+    if (
+        gpt_a_error is not None
+        or auralis_error is not None
+        or avbench_error is not None
+    ):
+        failed_stage_results = build_classic_stage_results(
+            metadata_issues=metadata_issues,
+            metadata_stats=metadata_stats,
+            gpt_a_issues=[
+                issue
+                for issue in gpt_a_stats.get("raw_prediction", ())
+                if isinstance(issue, Mapping)
+            ],
+            gpt_a_stats=gpt_a_stats,
+            gpt_a_error=gpt_a_error,
+            seed_lite_issues=[
+                issue
+                for issue in seed_lite_stats.get("accepted_issues", ())
+                if isinstance(issue, Mapping)
+            ],
+            seed_lite_stats=seed_lite_stats,
+            seed_lite_enabled=bool(seed_lite_model),
+            seed_lite_error=seed_lite_error,
+            auralis_issues=[
+                issue
+                for issue in auralis_stats.get("auralis_issues", ())
+                if isinstance(issue, Mapping)
+            ],
+            auralis_stats=auralis_stats,
+            auralis_error=auralis_error,
+            avbench_result=avbench_result,
+            avbench_stats=avbench_stats,
+            avbench_error=avbench_error,
+            ocr_visual_stats={},
+            ocr_visual_executed=False,
+        )
+        record_classic_evaluation(
+            gpt_a_input,
+            audio_input,
+            failed_stage_results,
+            run_stats=run_stats,
+        )
     if gpt_a_error is not None and auralis_error is not None:
         raise RuntimeError(
             f"GPT-A 失败：{gpt_a_error}；Auralis 失败：{auralis_error}"
@@ -1704,11 +1934,11 @@ def run_combined_row(
         model=gpt_a_model,
         timeout=timeout,
         api_retries=api_retries,
-        run_stats=run_stats,
+        run_stats=stats_sink,
     )
     ocr_visual_stats = (
-        run_stats.get("ocr_visual_verifier", {})
-        if isinstance(run_stats, Mapping)
+        stats_sink.get("ocr_visual_verifier", {})
+        if isinstance(stats_sink, Mapping)
         else {}
     )
     deduplicated_audio_prediction = deduplicate_prediction_issues(
@@ -1740,6 +1970,37 @@ def run_combined_row(
         )
         if isinstance(issue, Mapping)
     )
+    stage_results = build_classic_stage_results(
+        metadata_issues=metadata_issues,
+        metadata_stats=metadata_stats,
+        gpt_a_issues=[
+            issue
+            for issue in gpt_a_stats.get("raw_prediction", ())
+            if isinstance(issue, Mapping)
+        ],
+        gpt_a_stats=gpt_a_stats,
+        gpt_a_error=gpt_a_error,
+        seed_lite_issues=seed_lite_stats.get("deduplicated_issues", ()),
+        seed_lite_stats=seed_lite_stats,
+        seed_lite_enabled=bool(seed_lite_model),
+        seed_lite_error=seed_lite_error,
+        auralis_issues=auralis_stats.get("deduplicated_issues", ()),
+        auralis_stats=auralis_stats,
+        auralis_error=auralis_error,
+        avbench_result=avbench_result,
+        avbench_stats=avbench_stats,
+        avbench_error=avbench_error,
+        ocr_visual_stats=(
+            ocr_visual_stats if isinstance(ocr_visual_stats, Mapping) else {}
+        ),
+        ocr_visual_executed=True,
+    )
+    classic_evaluation = record_classic_evaluation(
+        gpt_a_input,
+        audio_input,
+        stage_results,
+        run_stats=run_stats,
+    )
     final_stats: Dict[str, Any] = {}
     if run_stats is not None:
         run_stats["final_synthesis"] = final_stats
@@ -1760,10 +2021,11 @@ def run_combined_row(
         deterministic_issues=required_issues,
     )
     if run_stats is not None:
-        run_stats["final_prediction"] = _prediction_array(
+        final_issues = _prediction_array(
             final_prediction,
             "最终 GPT",
         )
+        run_stats["final_prediction"] = final_issues
         run_stats["api_calls"] = sum(
             int(stats.get("api_calls", 0))
             for stats in (
@@ -1786,13 +2048,21 @@ def run_combined_row(
         )
         if seed_lite_error is not None:
             run_stats["seed_lite_warning"] = str(seed_lite_error)
+    else:
+        final_issues = _prediction_array(final_prediction, "最终 GPT")
+    classic_evaluation = EvaluationResult(
+        checks=classic_evaluation.checks,
+        final_issues=tuple(final_issues),
+        tool_trace=classic_evaluation.tool_trace,
+        compatibility_log=classic_evaluation.compatibility_log,
+    )
     return final_prediction
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "GPT-D：运行 GPT-A、Seed-Lite 视觉物理专家、Auralis 和 AVBench，最后调用 GPT 汇总证据并集。"
+            "AVAgent：运行视觉规划、Seed-Lite、Auralis 和 AVBench，最后汇总证据并集。"
         )
     )
     parser.add_argument("--input-csv", type=Path, default=INPUT_CSV)
@@ -1817,23 +2087,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-url",
-        default=os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        default=os.getenv(
+            "AVAGENT_API_URL",
+            os.getenv("VIDEO_EVAL_API_URL", DEFAULT_API_URL),
+        ),
     )
     parser.add_argument(
         "--gpt-a-model",
-        default=os.getenv("VIDEO_EVAL_MODEL", DEFAULT_GPT_A_MODEL),
+        default=os.getenv(
+            "AVAGENT_VISUAL_MODEL",
+            os.getenv("VIDEO_EVAL_MODEL", DEFAULT_GPT_A_MODEL),
+        ),
     )
     parser.add_argument(
         "--gemini-model",
         "--model",
         dest="gemini_model",
-        default=os.getenv("VIDEO_EVAL_GPT_D_MODEL", DEFAULT_MODEL),
+        default=os.getenv(
+            "AVAGENT_AUDIO_MODEL",
+            os.getenv("VIDEO_EVAL_JUDGE_MODEL", DEFAULT_MODEL),
+        ),
     )
     parser.add_argument(
         "--seed-lite-model",
         default=os.getenv(
-            "VIDEO_EVAL_SEED_LITE_MODEL",
-            DEFAULT_SEED_LITE_MODEL,
+            "AVAGENT_SEED_LITE_MODEL",
+            os.getenv("VIDEO_EVAL_SEED_LITE_MODEL", DEFAULT_SEED_LITE_MODEL),
         ),
         help="logo、动作物理和穿模候选子智能体模型。",
     )
@@ -1849,9 +2128,7 @@ def parse_args() -> argparse.Namespace:
         "--latentsync-root",
         default=os.getenv(
             "LATENTSYNC_ROOT",
-            str(BASE_DIR / ".external" / "LatentSync")
-            if (BASE_DIR / ".external" / "LatentSync").is_dir()
-            else "/public/yangjl/LatentSync",
+            str(BASE_DIR / ".external" / "LatentSync"),
         ),
     )
     parser.add_argument(
@@ -1929,9 +2206,11 @@ def main() -> int:
     _restart_with_cuda_libraries_if_needed()
     load_project_env(BASE_DIR / ".env.local")
     args = parse_args()
-    api_key = os.getenv(API_KEY_ENV, "").strip()
-    if not api_key:
-        raise ValueError(f"缺少环境变量 {API_KEY_ENV}；请设置 Ark 网关 token。")
+    api_key = gpt_a.require_api_key()
+    if not args.api_url:
+        raise ValueError("缺少 --api-url 或 AVAGENT_API_URL。")
+    if not args.gpt_a_model:
+        raise ValueError("缺少 --gpt-a-model 或 AVAGENT_VISUAL_MODEL。")
     table = gpt_a.read_csv(args.input_csv)
     if not table:
         raise ValueError("gt.csv 为空")
@@ -2035,7 +2314,7 @@ def main() -> int:
                     record = {
                         "row_index": index,
                         "序号": gpt_a.row_value(header, row, "序号"),
-                        "profile": "gpt_d_auralis_synthesis",
+                        "profile": "avagent_evidence_pipeline",
                         "gpt_a_model": args.gpt_a_model,
                         "gemini_model": args.gemini_model,
                         "seed_lite_model": (
@@ -2043,7 +2322,7 @@ def main() -> int:
                             if args.disable_seed_lite_specialist
                             else args.seed_lite_model
                         ),
-                        "input_mode": "live_gpt_a_seed_lite_auralis_avbench_then_gpt_synthesis",
+                        "input_mode": "live_visual_seed_lite_auralis_avbench_then_synthesis",
                         "success": prediction != "",
                         "elapsed_sec": round(time.monotonic() - started, 3),
                         "error": error_text,

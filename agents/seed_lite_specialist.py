@@ -13,12 +13,12 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 
-import call_ffmpeg_skill as visual_agent
+import run_visual_baseline as visual_agent
 
 
 DEFAULT_SEED_LITE_MODEL = "doubao-seed-2-0-lite-260428"
 
-SEED_LITE_SPECIALIST_SYSTEM_MESSAGE = """你是 Agent-D 中职责受限的 Seed-Lite 视觉物理子智能体。
+SEED_LITE_SPECIALIST_SYSTEM_MESSAGE = """你是 AVAgent 中职责受限的 Seed-Lite 视觉物理子智能体。
 
 你只生成以下三类候选，其他问题一律不输出：
 1. logo、商标、品牌字标、水印及服装/商品文字违反 prompt 或参考图约束；

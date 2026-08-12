@@ -49,7 +49,7 @@ conda activate avagent
 python -m pip install -r requirements-audio-agent.txt
 
 # SenseVoice/CAM++ worker uses the isolated avbench environment.
-/data/changxuanhao/AVagent/.conda-envs/avbench/bin/python -m pip install -r requirements-sensevoice.txt
+.conda-envs/avbench/bin/python -m pip install -r requirements-sensevoice.txt
 ```
 
 这些依赖和模型均在本机运行，不调用付费 ASR/OCR API。首次运行会通过
@@ -86,7 +86,7 @@ python scripts/smoke_auralis_local.py /path/to/video.mp4
 
 ```bash
 conda activate avagent
-python call_ffmpeg_skill_gpt_d.py \
+python run_avagent.py \
   --limit 2 \
   --output-csv output/benchmark/runs/gpt/auralis/pred.csv \
   --run-log output/benchmark/runs/gpt/auralis/run.jsonl

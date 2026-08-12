@@ -43,7 +43,7 @@ def main() -> int:
     models = dict(args.model)
     commands = build_experiment_commands(
         python=sys.executable,
-        script=BASE_DIR / "call_ffmpeg_skill.py",
+        script=BASE_DIR / "run_visual_baseline.py",
         models=models,
         profiles=tuple(args.profiles),
         limit=args.limit,
@@ -54,8 +54,11 @@ def main() -> int:
         for command in commands:
             print(shlex.join(command))
         return 0
-    if not os.getenv("ARK_API_KEY", "").strip():
-        raise SystemExit("缺少 ARK_API_KEY；请只在本机 shell 中设置，不要写入脚本。")
+    if not (
+        os.getenv("AVAGENT_API_KEY", "").strip()
+        or os.getenv("ARK_API_KEY", "").strip()
+    ):
+        raise SystemExit("缺少 AVAGENT_API_KEY；请只在本机环境中设置。")
 
     failures = 0
     for command in commands:

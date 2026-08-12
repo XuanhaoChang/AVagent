@@ -26,17 +26,17 @@ class ProjectEnvTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             env_path = Path(temporary) / ".env.local"
             env_path.write_text(
-                "ARK_API_KEY='from-file'\n"
-                "VIDEO_EVAL_API_URL=https://example.test/chat/completions\n",
+                "AVAGENT_API_KEY='from-file'\n"
+                "AVAGENT_API_URL=https://example.test/chat/completions\n",
                 encoding="utf-8",
             )
-            environ = {"ARK_API_KEY": "already-set"}
+            environ = {"AVAGENT_API_KEY": "already-set"}
 
             load_project_env(env_path, environ=environ)
 
-            self.assertEqual(environ["ARK_API_KEY"], "already-set")
+            self.assertEqual(environ["AVAGENT_API_KEY"], "already-set")
             self.assertEqual(
-                environ["VIDEO_EVAL_API_URL"],
+                environ["AVAGENT_API_URL"],
                 "https://example.test/chat/completions",
             )
 
@@ -46,7 +46,7 @@ class TextReviewTest(unittest.TestCase):
         args = build_parser().parse_args([])
         self.assertEqual(args.input_root, Path("output/human_review_samples"))
         self.assertEqual(args.output_jsonl, Path("output/text_review/results.jsonl"))
-        self.assertEqual(args.model, "gpt-5.5-2026-04-24")
+        self.assertEqual(args.model, "")
         self.assertFalse(args.resume)
 
     def test_messages_include_input_gt_predictions_and_material_audit(self):
@@ -115,16 +115,16 @@ class TextReviewTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (sample_dir / "gt.json").write_text("[]", encoding="utf-8")
-            (sample_dir / "gpt_d.json").write_text("[]", encoding="utf-8")
+            (sample_dir / "avagent.json").write_text("[]", encoding="utf-8")
 
             actual_input, gt, predictions = read_sample(
                 sample_dir,
-                ("gpt_d",),
+                ("avagent",),
             )
 
         self.assertEqual(actual_input, input_data)
         self.assertEqual(gt, [])
-        self.assertEqual(predictions, {"gpt_d": []})
+        self.assertEqual(predictions, {"avagent": []})
 
     def test_missing_required_materials_distinguishes_references_from_output_media(self):
         missing = missing_required_materials(
@@ -194,7 +194,7 @@ class TextReviewTest(unittest.TestCase):
                     "extra_prediction_indices": [1],
                     "confidence": "中",
                 }
-                for source in ("gpt_a", "gpt_d")
+                for source in ("gpt_a", "avagent")
             ],
         }
         self.assertEqual(
@@ -233,7 +233,7 @@ class TextReviewTest(unittest.TestCase):
                 '[{"问题说明":"音色错误"}]',
                 encoding="utf-8",
             )
-            (sample_dir / "gpt_d.json").write_text("[]", encoding="utf-8")
+            (sample_dir / "avagent.json").write_text("[]", encoding="utf-8")
             output = root / "results.jsonl"
             summary = root / "summary.json"
 
@@ -241,7 +241,7 @@ class TextReviewTest(unittest.TestCase):
                 "sample_id": "sample_001",
                 "reviews": [
                     {
-                        "prediction_source": "gpt_d",
+                        "prediction_source": "avagent",
                         "category": 3,
                         "reason": "缺少参考音频，但GT动作问题仍可判断。",
                         "gt_coverage": [
@@ -258,7 +258,11 @@ class TextReviewTest(unittest.TestCase):
                 ],
             }
             with (
-                mock.patch.dict(os.environ, {"ARK_API_KEY": "token"}, clear=True),
+                mock.patch.dict(
+                    os.environ,
+                    {"AVAGENT_API_KEY": "token"},
+                    clear=True,
+                ),
                 mock.patch.object(review_script, "load_project_env"),
                 mock.patch.object(
                     review_script,
@@ -271,7 +275,7 @@ class TextReviewTest(unittest.TestCase):
                         "--input-root",
                         str(root / "samples"),
                         "--prediction-source",
-                        "gpt_d",
+                        "avagent",
                         "--output-jsonl",
                         str(output),
                         "--summary-json",
@@ -336,28 +340,28 @@ class TextReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "预测来源"):
             parse_review_response(json.dumps(response, ensure_ascii=False), "#1")
 
-    def test_supports_single_gpt_d_prediction_source(self):
+    def test_supports_single_avagent_prediction_source(self):
         gt = [{"问题类型": "音频质量问题", "问题说明": "台词错误"}]
         predictions = {
-            "gpt_d": [{"问题类型": "音频质量问题", "问题说明": "台词错误"}]
+            "avagent": [{"问题类型": "音频质量问题", "问题说明": "台词错误"}]
         }
         messages = build_messages(
             "#1",
             {"user_prompt": "检查台词", "generated_video_url": "video.mp4"},
             gt,
             predictions,
-            prediction_sources=("gpt_d",),
+            prediction_sources=("avagent",),
         )
-        self.assertIn("reviews 必须按 gpt_d 顺序", messages[0]["content"])
+        self.assertIn("reviews 必须按 avagent 顺序", messages[0]["content"])
         self.assertNotIn("五个 prediction_source", messages[0]["content"])
         payload = json.loads(messages[1]["content"])
-        self.assertEqual(tuple(payload["predictions"]), ("gpt_d",))
+        self.assertEqual(tuple(payload["predictions"]), ("avagent",))
 
         response = {
             "sample_id": "#1",
             "reviews": [
                 {
-                    "prediction_source": "gpt_d",
+                    "prediction_source": "avagent",
                     "category": 1,
                     "reason": "完整覆盖。",
                     "gt_coverage": [
@@ -376,9 +380,9 @@ class TextReviewTest(unittest.TestCase):
         parsed = parse_review_response(
             json.dumps(response, ensure_ascii=False),
             "#1",
-            prediction_sources=("gpt_d",),
+            prediction_sources=("avagent",),
         )
-        self.assertEqual(parsed["reviews"][0]["prediction_source"], "gpt_d")
+        self.assertEqual(parsed["reviews"][0]["prediction_source"], "avagent")
 
     def test_multi_source_prompt_enforces_superset_coverage_monotonicity(self):
         messages = build_messages(
@@ -387,12 +391,12 @@ class TextReviewTest(unittest.TestCase):
             [{"问题说明": "台词错误"}],
             {
                 "gpt_a": [{"问题说明": "台词错误"}],
-                "gpt_d": [
+                "avagent": [
                     {"问题说明": "台词错误"},
                     {"问题说明": "额外杂音"},
                 ],
             },
-            prediction_sources=("gpt_a", "gpt_d"),
+            prediction_sources=("gpt_a", "avagent"),
         )
         self.assertIn("GT 覆盖不能更差", messages[0]["content"])
         self.assertIn("类别 1 变为类别 2", messages[0]["content"])
@@ -416,7 +420,7 @@ class TextReviewTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "预测来源"):
-                _read_existing(path, ("gpt_d",))
+                _read_existing(path, ("avagent",))
 
     def test_summary_counts_categories_per_prediction_source(self):
         results = [
@@ -438,16 +442,16 @@ class TextReviewTest(unittest.TestCase):
         self.assertEqual(summary["by_source"]["gpt_a"]["1"], 1)
         self.assertEqual(summary["by_source"]["gpt_b"]["3"], 1)
 
-    def test_summary_supports_single_gpt_d_source(self):
+    def test_summary_supports_single_avagent_source(self):
         results = [
             {
                 "sample_id": "sample_001",
-                "reviews": [{"prediction_source": "gpt_d", "category": 2}],
+                "reviews": [{"prediction_source": "avagent", "category": 2}],
             }
         ]
-        summary = summarize_results(results, prediction_sources=("gpt_d",))
-        self.assertEqual(tuple(summary["by_source"]), ("gpt_d",))
-        self.assertEqual(summary["by_source"]["gpt_d"]["2"], 1)
+        summary = summarize_results(results, prediction_sources=("avagent",))
+        self.assertEqual(tuple(summary["by_source"]), ("avagent",))
+        self.assertEqual(summary["by_source"]["avagent"]["2"], 1)
 
 
 if __name__ == "__main__":

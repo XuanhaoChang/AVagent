@@ -351,7 +351,7 @@ def _speaker_binding_summary(
 class SenseVoiceBackend:
     """Persistent subprocess wrapper for FunASR SenseVoice and CAM++.
 
-    The main Agent-D environment intentionally does not import PyTorch/FunASR.
+    The main AVAgent environment intentionally does not import PyTorch/FunASR.
     A long-lived worker in ``.conda-envs/avbench`` loads the models once and
     returns JSON so the ASR/OCR process remains lightweight and reproducible.
     """

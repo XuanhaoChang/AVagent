@@ -33,7 +33,7 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "可选 Agent-D JSONL 日志；提供后会按序号附加 asr.json 和 ocr.json，"
+            "可选 AVAgent JSONL 日志；提供后会按序号附加 asr.json 和 ocr.json，"
             "内容来自 auralis_evidence。"
         ),
     )

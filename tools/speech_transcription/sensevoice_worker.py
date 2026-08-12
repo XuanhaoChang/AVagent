@@ -1,4 +1,4 @@
-"""Line-oriented FunASR worker used by the Agent-D SenseVoice backend."""
+"""Line-oriented FunASR worker used by the AVAgent SenseVoice backend."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class _SmallSampleCamppCluster:
     FunASR 1.3.29's ``ClusterBackend`` intentionally returns one speaker when
     fewer than 20 embeddings are available.  That is a useful conservative
     default for its general diarization path, but it suppresses CAM++ evidence
-    for the short caption clips handled by Agent-D.  Reuse FunASR's spectral
+    for the short caption clips handled by AVAgent.  Reuse FunASR's spectral
     clustering and cosine merge threshold without that short-clip shortcut;
     if the tiny affinity matrix cannot be clustered, fall back to one speaker.
     """

@@ -3,10 +3,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import call_ffmpeg_skill as runner
+import run_visual_baseline as runner
 
 
-class CallFfmpegSkillTest(unittest.TestCase):
+class VisualBaselineEntryPointTest(unittest.TestCase):
     def test_text_visual_route_extracts_free_format_quoted_candidate(self):
         input_data = {
             "user_prompt": "装修报价单上写“据实结算”——这四个字等于“后期随便加钱”",

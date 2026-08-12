@@ -443,7 +443,7 @@ def filter_acoustically_contradicted_binding_issues(
                 }
             )
 
-        # Current Agent-D computes a deterministic resolution before invoking
+        # The current pipeline computes a deterministic resolution before invoking
         # Gemini.  The model may phrase a supported fact, but it cannot create
         # one.  Keep the legacy checks below only for callers using older
         # transcripts that do not yet carry resolver output.

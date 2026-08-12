@@ -17,6 +17,7 @@ __pycache__/
 .conda-envs/
 .conda-pkgs/
 .external/
+.local/
 
 # Local datasets, generated evaluations, and model artifacts
 input/

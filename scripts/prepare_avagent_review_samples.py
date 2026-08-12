@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare per-sample review packages for one Agent-D prediction CSV."""
+"""Prepare per-sample review packages for one AVAgent prediction CSV."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def export(
             }
             _write_json(sample_dir / "input.json", input_data)
             _write_json(sample_dir / "gt.json", gt_result.items)
-            _write_json(sample_dir / "agentd.json", prediction)
+            _write_json(sample_dir / "avagent.json", prediction)
 
             references = _json(
                 input_row.get("reference_image_urls", "[]"),
@@ -129,7 +129,7 @@ def export(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="准备 Agent-D 五类复核样本包")
+    parser = argparse.ArgumentParser(description="准备 AVAgent 五类复核样本包")
     parser.add_argument("--input-csv", type=Path, required=True)
     parser.add_argument("--gt-csv", type=Path, required=True)
     parser.add_argument("--prediction-csv", type=Path, required=True)

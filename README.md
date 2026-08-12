@@ -1,177 +1,170 @@
-# AVagent
+# AVAgent
 
-**Evidence-first evaluation for generated audio-video content.**
+Evidence-first evaluation for generated audio-video content.
 
-AVagent evaluates whether a generated video follows its prompt across the
-dimensions that are easy to miss in a frame-only review: speech, subtitles,
-speaker identity, lip-sync, text and logos, visual continuity, and basic
-physical plausibility. It combines deterministic measurements with model-based
-reasoning, while keeping the evidence chain visible for human review.
+AVAgent checks whether generated videos follow prompts and reference images
+across visual content, speech, subtitles, speaker consistency, and lip sync.
+Its central rule is that model suggestions are candidates: only findings backed
+by the available media evidence enter the final issue set.
 
-> The repository contains source code and tests only. Private datasets, model
-> weights, API credentials, and generated evaluation artifacts are kept outside
-> Git.
+> This repository contains source code and tests only. Datasets, model weights,
+> credentials, generated media, and experiment outputs are intentionally kept
+> outside Git.
 
-## What it does
+## Highlights
+
+- One auditable pipeline for visual inspection, ASR/OCR evidence, speaker
+  analysis, targeted visual checks, and AVBench/SyncNet.
+- Ten issue-oriented checks sharing cached tool results through a typed
+  `EvaluationContext`.
+- Evidence gates that distinguish `not_evaluable` from “no defect.”
+- CSV predictions plus JSONL traces suitable for human review and regression
+  analysis.
+- Deterministic unit tests that do not download models or call remote APIs.
+
+## Pipeline
 
 ```text
-                         ┌─────────────────────────┐
-                         │  Prompt + generated AV  │
-                         └────────────┬────────────┘
-                                      │
-                 ┌────────────────────┼────────────────────┐
-                 │                    │                    │
-                 ▼                    ▼                    ▼
-        ┌────────────────┐   ┌────────────────┐   ┌────────────────┐
-        │ GPT-A planning │   │ Auralis        │   │ AVBench/SyncNet│
-        │ prompt issues  │   │ ASR + OCR +    │   │ lip-sync       │
-        │ and criteria   │   │ Gemini review  │   │ evidence       │
-        └───────┬────────┘   └───────┬────────┘   └───────┬────────┘
-                │                    │                    │
-                └────────────────────┼────────────────────┘
-                                     ▼
-                         ┌─────────────────────────┐
-                         │ Final GPT synthesis    │
-                         │ merge, deduplicate,    │
-                         │ classify, preserve     │
-                         │ evidence boundaries   │
-                         └────────────┬────────────┘
-                                      ▼
-                         ┌─────────────────────────┐
-                         │ Prediction + run log   │
-                         │ + human-review package  │
-                         └─────────────────────────┘
+Prompt + references + generated video
+                 │
+       ┌─────────┼──────────┐
+       ▼         ▼          ▼
+ visual agent  Auralis   AVBench/SyncNet
+              ASR/OCR      lip sync
+       └─────────┼──────────┘
+                 ▼
+       shared evidence + classic checks
+                 ▼
+       final merge and deduplication
+                 ▼
+       prediction CSV + JSONL audit log
 ```
 
-The central design principle is simple: a model may propose an issue, but a
-claim is only promoted when the available evidence supports it. ASR, OCR,
-speaker tracks, timing measurements, and visual observations remain separate
-so that a reviewer can trace a result back to its source.
-
-## Evidence boundaries
-
-| Signal | Used for | Not treated as proof by itself |
-| --- | --- | --- |
-| GPT-A | Extracting prompt requirements and expected entities | A visual or audio defect in the video |
-| ASR and constrained candidate scoring | Spoken content, word substitutions, speaker turns | Ground-truth semantics without context |
-| OCR | Proposing locations and candidate strings for visible text | Proof that a detected shape is text, or that scene text is a subtitle |
-| OCR visual gate | Classifying OCR crops as subtitles, scene text/UI, logos, or non-text texture | Inventing issues that were not proposed by Auralis |
-| Gemini / Auralis | Evidence-aware multimodal judgment and issue wording | A substitute for missing evidence |
-| CAM++ / speaker tracks | Voice-to-entity consistency checks | Absolute speaker identity without prompt context |
-| AVBench / SyncNet | Audio-video synchronization | A defect from a raw score or boundary hit alone |
-| Seed-Lite | Targeted visual checks such as logos and motion continuity | A universal detector for every visual artifact |
+See [Architecture](docs/architecture.md) for component boundaries and evidence
+contracts.
 
 ## Quick start
 
-The project is tested in the `avagent` Python environment.
+Clone the submodule and run the deterministic test suite:
 
 ```bash
-conda activate avagent
-python -m pip install -r requirements-audio-agent.txt
+git clone --recurse-submodules https://github.com/XuanhaoChang/AVagent.git
+cd AVagent
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-For a dependency-free local smoke check of the media-evidence path:
+Runtime components have separate dependency boundaries:
 
 ```bash
-python scripts/smoke_auralis_local.py /path/to/video.mp4
+# Parent process: OCR and tabular runtime
+python -m pip install -r requirements-audio-agent.txt
+
+# Isolated AVBench/SenseVoice environment
+python -m pip install -r third_party/AVBench/requirements.txt
+python -m pip install -r requirements-avbench.txt
+python -m pip install -r requirements-sensevoice.txt
 ```
 
-Keep credentials in the local environment (for example `.env.local`); never
-place them in source files or commits.
+The model-heavy environment also needs a compatible PyTorch/CUDA installation,
+LatentSync, and the SyncNet/S3FD checkpoints. AVAgent never downloads these
+assets as part of tests or repository setup.
 
-## Run Agent-D
+## Configuration
 
-`call_ffmpeg_skill_gpt_d.py` is the current evaluation entry point. A typical
-auditable run writes both the prediction CSV and a JSONL execution log into a
-task-specific output directory:
+Copy the template and fill it locally:
 
 ```bash
-python call_ffmpeg_skill_gpt_d.py \
-  --input-csv output/captionErr/agentd_input.csv \
-  --latentsync-root .external/LatentSync \
-  --avbench-syncnet-ckpt .external/LatentSync/checkpoints/auxiliary/syncnet_v2.model \
-  --avbench-python .conda-envs/avbench/bin/python \
-  --output-csv output/captionErr/agentd/pred.csv \
-  --run-log output/captionErr/agentd/run.jsonl
+cp .env.example .env.local
 ```
 
-The input CSV should identify the media and prompt for each row. Validate row
-IDs and media paths before a large run, and inspect `run.jsonl` for record
-counts, failures, and audio-availability diagnostics.
+AVAgent expects an OpenAI-compatible Chat Completions gateway capable of the
+configured multimodal requests. Keep all credentials in `.env.local`; the file
+is ignored by Git.
 
-## Human-review workflow
+Required settings:
 
-Review packages preserve the original sample structure and include the
-Agent-D output plus deterministic ASR/OCR evidence. The standard flow is:
+- `AVAGENT_API_KEY`
+- `AVAGENT_API_URL`
+- `AVAGENT_VISUAL_MODEL`
+
+Optional specialist and local-runtime settings are documented in
+[`.env.example`](.env.example).
+
+## Run an evaluation
+
+The public entry point is `run_avagent.py`. The input schema is demonstrated in
+[`examples/input.example.csv`](examples/input.example.csv).
+
+```bash
+python run_avagent.py \
+  --input-csv input/gt.csv \
+  --output-csv output/demo/predictions.csv \
+  --run-log output/demo/run.jsonl \
+  --latentsync-root /path/to/LatentSync \
+  --avbench-syncnet-ckpt /path/to/syncnet_v2.model \
+  --avbench-python /path/to/avbench/python
+```
+
+Before a large run, validate row IDs and media paths with a one-row invocation:
+
+```bash
+python run_avagent.py --input-csv input/gt.csv --limit 1 \
+  --output-csv output/smoke/predictions.csv \
+  --run-log output/smoke/run.jsonl
+```
+
+The current benchmark-compatible CSV keeps the original six columns and adds
+`GPT预测结果`. The `思考过程及标准答案` column is preserved in the output but is
+never included in model requests.
+
+## Human review
 
 ```bash
 python scripts/export_human_review_samples.py \
-  --input-csv output/<task>/agentd_input.csv \
-  --output-root output/<task>/human_review_samples
+  --input-csv input/gt.csv \
+  --output-root output/demo/review_samples
 
 python scripts/attach_prediction_to_review_samples.py \
-  --prediction-csv output/<task>/agentd/pred.csv \
-  --samples-root output/<task>/human_review_samples \
-  --label agentd \
-  --run-log output/<task>/agentd/run.jsonl
+  --prediction-csv output/demo/predictions.csv \
+  --samples-root output/demo/review_samples \
+  --label avagent \
+  --run-log output/demo/run.jsonl
 
 python scripts/review_text_predictions.py \
-  --input-root output/<task>/human_review_samples \
-  --output-jsonl output/<task>/review/results.jsonl \
-  --summary-json output/<task>/review/summary.json \
-  --prediction-source agentd
-
-python scripts/classify_samples_by_gpt_a.py \
-  --samples-root output/<task>/human_review_samples \
-  --reviews-jsonl output/<task>/review/results.jsonl \
-  --prediction-source agentd \
-  --output-root output/<task>/human_review_samples_by_agentd
+  --input-root output/demo/review_samples \
+  --output-jsonl output/demo/review/results.jsonl \
+  --summary-json output/demo/review/summary.json \
+  --prediction-source avagent
 ```
 
-The resulting package is designed to answer three questions independently:
-
-1. What did the prompt require?
-2. What does the generated video provide as evidence?
-3. Did the evaluator describe and localize the defect accurately?
-
-## Repository map
+## Repository layout
 
 ```text
-av_eval/                 Dataset, taxonomy, routing, scoring, and CLI modules
-agents/auralis/          ASR/OCR, constrained evidence, and Gemini orchestration
-tools/                   Shared media, transcription, subtitle, and utility tools
-scripts/                 Experiment, export, review, and smoke-test entry points
-tests/                   Deterministic unittest coverage
-third_party/AVBench/     AVBench submodule for synchronization evaluation
-call_ffmpeg_skill_gpt_d.py  Current Agent-D entry point
-call_ffmpeg_skill.py        Original baseline for comparison
+agents/                  Specialist orchestration and evidence gates
+agents/classic_checks/   Shared contracts and ten issue checks
+av_eval/                 Dataset, audit, routing, review, and CLI modules
+configs/                 Runtime prompts and non-secret configuration
+docs/                    Public architecture documentation
+examples/                Small, non-private input examples
+scripts/                 Evaluation, export, review, and smoke commands
+tests/                   Deterministic unittest suite
+third_party/AVBench/     Upstream AVBench Git submodule
+tools/                   Media, transcription, subtitle, and alignment tools
+run_avagent.py           Main evaluation entry point
+run_visual_baseline.py   Standalone visual-only baseline
 ```
 
-Local `input/`, `output/`, `models/`, checkpoints, caches, and generated media
-are intentionally ignored. Obtain private assets through the approved local
-deployment process instead of adding them to this repository.
+Local datasets, outputs, checkpoints, caches, and archived experiments belong
+under ignored paths such as `input/`, `output/`, `models/`, and `.local/`.
 
-## Development
+## Contributing and security
 
-Use small, deterministic changes and add a corresponding test for behavior
-changes. The project uses `unittest` as its validation interface:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull-request checks.
+Report vulnerabilities using [SECURITY.md](SECURITY.md), not a public issue.
 
-```bash
-python -m unittest discover -s tests -p 'test_*.py'
-python -m av_eval.cli capacity-plan --output /tmp/avagent-capacity.json
-```
+## License
 
-Before submitting a change, check that no credentials, raw evaluation media,
-model weights, or generated outputs are staged:
-
-```bash
-git status --short
-git diff --cached --name-only
-```
-
-## License and data
-
-No private evaluation data or model distribution is implied by this source
-repository. Follow the licenses and access terms of each external dependency
-and obtain any required checkpoints or datasets separately.
+Licensed under the [Apache License 2.0](LICENSE).

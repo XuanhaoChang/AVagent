@@ -25,7 +25,7 @@ def _load_evaluator(args: argparse.Namespace):
     os.chdir(latentsync_root)
     sys.path.insert(0, str(evaluation_dir))
     sys.path.insert(0, str(latentsync_root))
-    from evaluate_syncnet import evaluate_lip_sync
+    from av_eval.syncnet import evaluate_lip_sync
     from eval.syncnet.syncnet_eval import SyncNetEval
     from eval.syncnet_detect import SyncNetDetector
     import torch

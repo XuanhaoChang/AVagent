@@ -1,6 +1,6 @@
 """Process-isolated single-video adapter around AVBench's SyncNet evaluator.
 
-Agent-D's ASR/OCR stack and AVBench intentionally use separate environments:
+AVAgent's ASR/OCR stack and AVBench intentionally use separate environments:
 the former does not need PyTorch, while the latter uses a CUDA PyTorch build.
 This adapter keeps a small JSON-lines worker alive so the SyncNet model is
 loaded once and reused for every row in a run.
@@ -19,11 +19,7 @@ from typing import Any, Dict
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_LATENTSYNC_ROOT = str(
-    BASE_DIR / ".external" / "LatentSync"
-    if (BASE_DIR / ".external" / "LatentSync").is_dir()
-    else "/public/yangjl/LatentSync"
-)
+DEFAULT_LATENTSYNC_ROOT = str(BASE_DIR / ".external" / "LatentSync")
 DEFAULT_AVBENCH_PYTHON = BASE_DIR / ".conda-envs" / "avbench" / "bin" / "python"
 WORKER_MODULE = "agents.avbench_worker"
 

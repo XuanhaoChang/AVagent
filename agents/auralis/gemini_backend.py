@@ -749,7 +749,7 @@ def chat_completion(
     timeout: int,
     max_attempts: int,
 ) -> Dict[str, Any]:
-    """Compatibility API for the former monolithic GPT-D script."""
+    """Compatibility API for the former monolithic pipeline script."""
     gateway = GeminiGateway(
         api_url=api_url,
         api_key=api_key,

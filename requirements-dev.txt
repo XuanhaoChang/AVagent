@@ -1,0 +1,2 @@
+# Deterministic unit-test dependency.
+numpy==2.2.6

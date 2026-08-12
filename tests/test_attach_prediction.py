@@ -11,7 +11,7 @@ from av_eval.review_export import (
 
 
 class AttachPredictionTest(unittest.TestCase):
-    def test_attaches_gpt_d_prediction_by_sample_order(self):
+    def test_attaches_avagent_prediction_by_sample_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             samples = root / "samples"
@@ -44,7 +44,7 @@ class AttachPredictionTest(unittest.TestCase):
             count = attach_prediction_to_review_samples(
                 prediction_csv=csv_path,
                 samples_root=samples,
-                label="gpt_d",
+                label="avagent",
             )
 
             self.assertEqual(count, 2)
@@ -53,7 +53,7 @@ class AttachPredictionTest(unittest.TestCase):
                     (
                         samples
                         / f"sample_{index:03d}"
-                        / "gpt_d.json"
+                        / "avagent.json"
                     ).read_text(encoding="utf-8")
                 )
                 self.assertEqual(value, prediction)
@@ -80,7 +80,7 @@ class AttachPredictionTest(unittest.TestCase):
             attach_prediction_to_review_samples(
                 prediction_csv=csv_path,
                 samples_root=samples,
-                label="gpt_d",
+                label="avagent",
                 replace=True,
             )
             for index in (1, 2):
@@ -88,7 +88,7 @@ class AttachPredictionTest(unittest.TestCase):
                     (
                         samples
                         / f"sample_{index:03d}"
-                        / "gpt_d.json"
+                        / "avagent.json"
                     ).read_text(encoding="utf-8")
                 )
                 self.assertEqual(value, replacement)

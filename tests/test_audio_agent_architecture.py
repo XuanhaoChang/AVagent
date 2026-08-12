@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-import call_ffmpeg_skill_gpt_d as legacy_runner
+import run_avagent as pipeline_runner
 import numpy as np
 from agents.auralis.agent import AuralisAgent, deterministic_alignment_issues
 from agents.auralis.schemas import AuralisEvidence, AuralisInput, AuralisResult
@@ -894,25 +894,25 @@ class AudioAgentArchitectureTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                legacy_runner.gpt_a,
+                pipeline_runner.gpt_a,
                 "run_agent",
                 side_effect=RuntimeError("visual failed"),
             ),
             mock.patch.object(
-                legacy_runner,
+                pipeline_runner,
                 "run_audio_row",
                 side_effect=lambda *_args, **_kwargs: calls.append("auralis")
                 or "[]",
             ),
             mock.patch.object(
-                legacy_runner,
+                pipeline_runner,
                 "run_avbench_row",
                 side_effect=lambda *_args, **_kwargs: calls.append("avbench")
                 or {"success": True, "status": "ok"},
             ),
             self.assertRaisesRegex(RuntimeError, "visual failed"),
         ):
-            legacy_runner.run_combined_row(
+            pipeline_runner.run_combined_row(
                 {"序号": "#1"},
                 {"序号": "#1"},
                 api_url="https://example.test",

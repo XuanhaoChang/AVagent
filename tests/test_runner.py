@@ -8,7 +8,7 @@ class RunnerTest(unittest.TestCase):
     def test_commands_keep_credentials_in_environment_and_separate_outputs(self):
         commands = build_experiment_commands(
             python="python3",
-            script=Path("call_ffmpeg_skill.py"),
+            script=Path("run_visual_baseline.py"),
             models={"gpt": "gpt-model", "seed_lite": "seed-model"},
             profiles=("baseline_a", "harness_b"),
             limit=2,
@@ -24,7 +24,7 @@ class RunnerTest(unittest.TestCase):
     def test_capacity_commands_use_fixed_sample_and_required_image_counts(self):
         commands = build_capacity_commands(
             python="python3",
-            script=Path("call_ffmpeg_skill.py"),
+            script=Path("run_visual_baseline.py"),
             model="gpt-model",
             sample_index=39,
             image_counts=(8, 16, 32, 48, 60, 80),

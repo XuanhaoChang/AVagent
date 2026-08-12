@@ -3,7 +3,7 @@
 OCR is deliberately treated as a proposal mechanism here.  A recognizer can
 map stars, dashboard graphics, clothing hardware, or decorative inscriptions
 to plausible characters with high confidence.  Before a non-deterministic
-Auralis text issue enters Agent-D's required union, this module asks an
+Auralis text issue enters AVAgent's required union, this module asks an
 independent visual model to inspect the exact full-resolution frame and OCR
 crop and classify what is actually visible.
 
@@ -22,7 +22,7 @@ import re
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
-import call_ffmpeg_skill as visual_agent
+import run_visual_baseline as visual_agent
 
 
 MAX_SEGMENTS_PER_ISSUE = 3
@@ -44,7 +44,7 @@ _ALLOWED_REGION_TYPES = {
 }
 
 
-OCR_VISUAL_VERIFIER_SYSTEM_MESSAGE = """你是 Agent-D 的 OCR 高清视觉证据复核器，不是通用视频评测器。
+OCR_VISUAL_VERIFIER_SYSTEM_MESSAGE = """你是 AVAgent 的 OCR 高清视觉证据复核器，不是通用视频评测器。
 
 你只裁决输入中已有的 Auralis 文字问题候选，不能添加新问题，也不能判断音频内容。OCR 字符、
 OCR 置信度和 Auralis/Gemini 的问题说明都只是待核查候选，不是事实。每个候选都附有原始高清帧

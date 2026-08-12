@@ -28,7 +28,7 @@ def main() -> int:
     counts = (8, 16, 32, 48, 60, 80)
     commands = build_capacity_commands(
         python=sys.executable,
-        script=BASE_DIR / "call_ffmpeg_skill.py",
+        script=BASE_DIR / "run_visual_baseline.py",
         model=args.model,
         sample_index=args.sample_index,
         image_counts=counts,
@@ -39,8 +39,11 @@ def main() -> int:
         for command in commands:
             print(shlex.join(command))
         return 0
-    if not os.getenv("ARK_API_KEY", "").strip():
-        raise SystemExit("缺少 ARK_API_KEY；请只在本机 shell 中设置。")
+    if not (
+        os.getenv("AVAGENT_API_KEY", "").strip()
+        or os.getenv("ARK_API_KEY", "").strip()
+    ):
+        raise SystemExit("缺少 AVAGENT_API_KEY；请只在本机环境中设置。")
 
     results = []
     for count, command in zip(counts, commands):

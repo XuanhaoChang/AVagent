@@ -8,10 +8,10 @@ import wave
 from pathlib import Path
 from unittest import mock
 
-import call_ffmpeg_skill_gpt_d as runner
+import run_avagent as runner
 
 
-class CallFfmpegSkillGptDTest(unittest.TestCase):
+class AVAgentEntryPointTest(unittest.TestCase):
     def test_extracts_free_format_resolution_and_single_shot_duration(self):
         constraints = runner.extract_visual_metadata_constraints(
             {
@@ -101,10 +101,10 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
             [],
         )
 
-    def test_uses_configured_gemini_flash_through_existing_ark_gateway(self):
+    def test_uses_public_configuration_names(self):
         self.assertEqual(runner.DEFAULT_MODEL, "gemini-3.5-flash")
-        self.assertEqual(runner.API_KEY_ENV, "ARK_API_KEY")
-        self.assertIn("/ark-router/v1/chat/completions", runner.DEFAULT_API_URL)
+        self.assertEqual(runner.API_KEY_ENV, "AVAGENT_API_KEY")
+        self.assertEqual(runner.DEFAULT_API_URL, "")
 
     def test_inference_input_includes_references_but_excludes_feedback_and_gold(self):
         header = [
@@ -1206,9 +1206,11 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
                 return json.dumps(response).encode("utf-8")
 
         parts = [{"text": "test"}]
+        model = "test-model"
+        api_url = "https://example.test/chat/completions"
         expected_bytes = len(
             json.dumps(
-                runner.build_chat_payload(runner.DEFAULT_MODEL, parts),
+                runner.build_chat_payload(model, parts),
                 ensure_ascii=False,
             ).encode("utf-8")
         )
@@ -1221,9 +1223,9 @@ class CallFfmpegSkillGptDTest(unittest.TestCase):
             mock.patch.object(runner.time, "sleep"),
         ):
             message = runner.chat_completion(
-                runner.DEFAULT_API_URL,
+                api_url,
                 "token",
-                runner.DEFAULT_MODEL,
+                model,
                 parts,
                 timeout=1,
                 max_attempts=2,

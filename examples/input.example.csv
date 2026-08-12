@@ -1,0 +1,2 @@
+序号,user_prompt,reference_image_urls,generated_video_url,用户反馈,思考过程及标准答案
+example-001,一位人物面对镜头清晰地说你好,[],/absolute/path/to/video.mp4,,

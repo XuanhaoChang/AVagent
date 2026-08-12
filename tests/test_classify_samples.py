@@ -13,20 +13,20 @@ from scripts.classify_samples_by_gpt_a import (
 
 class ClassifySamplesTest(unittest.TestCase):
     def test_default_output_root_follows_prediction_source(self):
-        args = build_parser().parse_args(["--prediction-source", "gpt_d"])
+        args = build_parser().parse_args(["--prediction-source", "avagent"])
         self.assertEqual(
             resolve_output_root(args),
-            Path("output/human_review_samples_by_gpt_d"),
+            Path("output/human_review_samples_by_avagent"),
         )
 
-    def test_classifies_gpt_d_and_writes_gpt_d_review(self):
+    def test_classifies_avagent_and_writes_avagent_review(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             samples = root / "samples"
             sample = samples / "sample_001"
             sample.mkdir(parents=True)
             (sample / "gt.json").write_text("[]\n", encoding="utf-8")
-            (sample / "gpt_d.json").write_text("[]\n", encoding="utf-8")
+            (sample / "avagent.json").write_text("[]\n", encoding="utf-8")
             reviews = root / "reviews.jsonl"
             reviews.write_text(
                 json.dumps(
@@ -34,7 +34,7 @@ class ClassifySamplesTest(unittest.TestCase):
                         "sample_id": "sample_001",
                         "reviews": [
                             {
-                                "prediction_source": "gpt_d",
+                                "prediction_source": "avagent",
                                 "category": 3,
                                 "category_name": "没有完全指出GT的问题",
                                 "reason": "遗漏问题。",
@@ -50,13 +50,13 @@ class ClassifySamplesTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            records = read_source_reviews(reviews, "gpt_d")
+            records = read_source_reviews(reviews, "avagent")
             output = root / "classified"
             counts = copy_classified_samples(
                 samples,
                 output,
                 records,
-                prediction_source="gpt_d",
+                prediction_source="avagent",
             )
 
             destination = (
@@ -65,11 +65,11 @@ class ClassifySamplesTest(unittest.TestCase):
                 / "sample_001"
             )
             self.assertEqual(counts[3], 1)
-            self.assertTrue((destination / "gpt_d_review.json").is_file())
+            self.assertTrue((destination / "avagent_review.json").is_file())
             summary = json.loads(
                 (output / "summary.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(summary["prediction_source"], "gpt_d")
+            self.assertEqual(summary["prediction_source"], "avagent")
 
 
 if __name__ == "__main__":
